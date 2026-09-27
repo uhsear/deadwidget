@@ -3,11 +3,15 @@
 Find the Experience Builder widgets that are bound to a layer that no longer exists.
 
 Somebody tidies a web map and removes a sublayer nobody seems to use. A week later somebody
-republishes a map service, and its sublayers come back renumbered. Neither change touches the
-Experience Builder app. The builder opens it without an error, the app loads, and the map draws.
-The search widget, the table and the "near me" panel that pointed at those sublayers now point
-at nothing. In production, a user clicks the widget and nothing happens. Nobody sees an error,
-because none is raised.
+republishes a map service with fewer sublayers, and the old ids at the end of the list are gone.
+Neither change touches the Experience Builder app. The builder opens it without an error, the app
+loads, and the map draws. The search widget, the table and the "near me" panel that pointed at
+those sublayers now point at nothing. In production, a user clicks the widget and nothing
+happens. Nobody sees an error, because none is raised.
+
+This tool finds a binding whose layer id no longer exists. A renumber that gives an old id to a
+different layer is another failure, because the widget then reads the wrong layer. This tool does
+not find that one. Limits says why.
 
 The link that broke is a string in the app configuration, such as
 `dataSource_1-18f00000001-layer-25-15`. That string means "the web map data source, then web map
@@ -29,6 +33,7 @@ PASS  the clean fixture resolves every reference and exits 0
 PASS  and it checked all 33 references, not zero
 PASS  it read the six services a reference needed
 PASS  and the one web map the app names
+PASS  a republish that gives id 15 to another layer still reads ok: the tool checks that an id exists, not what it names (Limits)
 PASS  sublayer 15 is published, so layer-25-15 resolves
 PASS  and layer-25-1 is DANGLING although it is a prefix of layer-25-15  <-- pinned defect
 PASS  and the reverse: layer-25-15 is not found inside a published layer-25-1  <-- pinned defect
@@ -52,6 +57,8 @@ PASS  a one-word suffix under a WEB_MAP main is a layer, not a data view, so it 
 ...
 PASS  a dangling reference in a top-level array is DANGLING, not inert  <-- pinned defect
 ...
+PASS  a stale Map Layers or Swipe block the builder left behind is one INERT note each and exits 0, not N DANGLING and 1  <-- pinned defect
+...
 PASS  config/config.json is named the builder draft and the item data the published copy  <-- pinned defect
 PASS  a reference that is not audited makes the run incomplete, exit 2, even beside a dangling one  <-- pinned defect
 ...
@@ -70,15 +77,19 @@ PASS  with no stdout or stderr at all, as under pythonw, each exit code stands a
 ...
 PASS  --out without --apply writes nothing at all  <-- pinned defect
 ...
+PASS  --out naming the app, the draft, a web map or a service file, however it is spelled, is refused and the input is kept  <-- pinned defect
+...
 PASS  a file and a portal together are a usage error  <-- pinned defect
 ...
-PASS  online: the service on another host gets no token  <-- pinned defect
+PASS  online: and no request at all goes to a host that only web map data names  <-- pinned defect
 ...
 PASS  online: the token never reaches stdout or stderr  <-- pinned defect
 ...
 PASS  online: a portal error that echoes the token is printed redacted  <-- pinned defect
 ...
 PASS  and urllib's error, which quotes the whole url, is redacted  <-- pinned defect
+PASS  and so is one whose token holds a space
+PASS  and the token's + for a space is redacted too  <-- pinned defect
 PASS  a local file url is unread
 PASS  and it is refused before any request is made  <-- pinned defect
 PASS  a network share url is unread
@@ -86,24 +97,28 @@ PASS  and it is refused before any request is made  <-- pinned defect
 ...
 PASS  a redirect to an ftp url is unread
 PASS  and the ftp url is never opened  <-- pinned defect
+...
 PASS  a redirect to another http url is still followed
+PASS  online: a redirect never carries the token to a host that may not have it  <-- pinned defect
+PASS  online: and it follows one to a trusted host
+PASS  online: and a read with no token follows the redirect
 PASS  online: a web map layer with a file: url leaves its sublayers UNJUDGED and fetches nothing  <-- pinned defect
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-249 assertions, 0 failed
+260 assertions, 0 failed
 ```
 
-The full run prints all 249 assertions. The `...` lines above are where this block is cut.
+The full run prints all 260 assertions. The `...` lines above are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 249 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
+The same 260 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
 with `-W error`, and the three runs print identical output.
 Branch coverage of `deadwidget.py` under `--self-test` is 100 percent, with no line excluded.
 
@@ -148,8 +163,8 @@ python deadwidget.py --portal https://org.maps.arcgis.com --item <app item id>
 | `--portal` | none | Portal url. Online mode. Must start with `https://` or `http://`. |
 | `--item` | none | The app's item id, 32 hexadecimal characters. Online mode. |
 | `--token` | none | A portal token. The `DEADWIDGET_TOKEN` environment variable is the better place for it. |
-| `--trust-host` | none | Another host that can receive the token, such as a federated server. Repeatable. |
-| `--out` | none | Path for a JSON report. |
+| `--trust-host` | none | Another host that the tool can read services from and send the token to, such as a federated server. Repeatable. |
+| `--out` | none | Path for a JSON report. A path that names one of the input files is refused, exit 64, and the input is kept. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
 | `--self-test` | off | Run the assertions and exit. |
 
@@ -185,7 +200,7 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 | `OK` | The id resolves to a layer that exists. | no |
 | `DANGLING` | The data source is not declared, the web map has no such layer, a web map `layers` array that decides the sublayers omits the sublayer, or the service no longer publishes it. Limits says when the array decides. | exit 1 |
 | `UNJUDGED` | The web map or the service needed to decide could not be read. | exit 2 |
-| `INERT` | Dangling, but inside the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. This was read from the Table widget's code, and Limits gives the cost. The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
+| `INERT` | Dangling, but in an entry that no widget reads. There are two such places. The first is the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. The second is a Swipe or Map Layers block kept for a map view that no longer exists (see below). The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
 | `NOT AUDITED` | A child of a web scene, a widget output, a subtype group layer, a knowledge graph layer, a feature collection, or another type this tool does not model. Nothing checked it, so it is not clean. | exit 2 |
 
 **Two traps from the author's prototype.** Both are pinned in the self-test.
@@ -196,6 +211,14 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 2. `layer-25-1` is a substring of `layer-25-15`. A substring test found sixteen defects on one
    real app that did not exist. This tool compares whole ids, and every prefix match stops at a
    dash.
+
+**Map views that are left behind.** The Swipe widget keys `swipeMapViewList`, and the Map Layers
+widget keys `customizeLayerOptions`, by a map view id: `<map widget id>-<data source id>`. Esri's
+`JimuLayerView` builds a layer view id from that map view id. When a map widget moves to another
+web map, the builder keeps the block for the old map view. The widget reads only the block of a map
+view that exists. So the tool judges the entries of a block whose map view is a data source that
+the map widget uses. A block for any other map view is one `INERT` note at most, and the tool does
+not judge its entries. The self-test pins both cases.
 
 **The two copies of the configuration.** An Experience Builder app stores its configuration
 twice. The item `/data` is the published copy, and users get it. The `config/config.json` resource
@@ -274,13 +297,26 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 
 - The token comes from `--token` or from `DEADWIDGET_TOKEN`. The environment variable is the
   better place, because every process on the machine can read a command line.
-- The token goes only to the portal's own host, to a host named with `--trust-host`, and, when
-  the portal is ArcGIS Online, to other `arcgis.com` hosts where hosted services live. A service
-  on any other host is read anonymously.
+- The tool sends requests only to the portal's own host, to a host named with `--trust-host`,
+  and, when the portal is ArcGIS Online, to other `arcgis.com` hosts where hosted services live.
+  A service url comes from web map data, which any author can write. Fetched blindly, it could
+  send requests from your machine to any address the machine can reach, such as a LAN host, and
+  print the answer. A service on any other host is not read. Its references are `UNJUDGED`, the
+  reason names `--trust-host`, and the run exits 2. The self-test pins that no request reaches
+  such a host.
+- A host is matched by name, not by port. A redirect from an accepted host is followed to another
+  `http` or `https` url. A redirect that would carry the token is followed only to an accepted
+  host.
+- The token goes to the same hosts, so a public service on another host, such as an Esri Living
+  Atlas layer under an Enterprise portal, is audited only when you trust that host with the token
+  too. Offline mode, with `--service URL=FILE`, audits it without the token.
+- A token with a space before or after it, as a Windows `set` line can leave, is stripped before
+  use.
 - The token is never sent over plain `http`, except to the loopback address. A plain `http`
   portal together with a token is refused before any request.
-- Every line the tool prints and the report file are redacted. The self-test serves a portal
-  error that echoes the token back, and asserts that the token reaches neither.
+- Every line the tool prints and the report file are redacted. The token is removed raw and in
+  both url forms, where a space is `+` or `%20`. The self-test serves a portal error that echoes
+  the token back, and asserts that the token reaches neither.
 - The resource is read with a changing `_ts` parameter and `Cache-Control: no-cache`, because the
   portal caches it and a plain read can return the copy from before the last save.
 - An error body from the portal, a sign-in page instead of JSON, and a service that answers with
@@ -327,12 +363,21 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   escapes, so that a Windows job that redirects the output to a file cannot fail halfway through
   the report. A control character, such as a line break or an escape, is printed as `\x0a` or
   `\x1b`. So a label cannot drive the terminal or add a false `VERDICT` line to a job's log.
-- It checks that each layer exists. It does not check the field names a widget uses. A renamed
-  field is another silent failure, and it is not this one.
+- It checks that each layer id exists. It does not check which layer the id now names. A
+  republish that inserts or removes a sublayer often shifts the ids, so an old id can still exist
+  and name a different layer. Such a binding reads `OK`, and the run can exit 0 with "every data
+  source reference resolves". The widget then reads the wrong layer. The self-test pins this limit:
+  sublayer 15 renamed from a zoning layer to "Parcels" still reads `OK`. Compare the service's
+  layer names with what each widget should show after any republish that changes the layer list.
+- It does not check the field names a widget uses. A renamed field is another silent failure, and
+  it is not this one.
 - `childDataSourceJsons` entries are overrides for a layer. They are not references, so a stale
   override is not reported.
 - It audits one app per run. It does not sweep an organization.
 - A widget that refers to another widget, for example through `useMapWidgetIds`, is not checked.
+  The only use of another widget is the map view rule above: a Swipe or Map Layers block counts
+  as current when its map view is `<widget id>-<data source id>` for a data source that some
+  widget in the app uses.
 - It changes nothing. Re-binding a widget is done in the builder, or with the two-copy write that
   the app then needs.
 

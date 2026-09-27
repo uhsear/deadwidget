@@ -4,9 +4,10 @@
 An Experience Builder widget names its layer by a data source id such as
 dataSource_1-18f2a3b4c5d-layer-7-3: the app's web map data source, the web map
 layer id, and the sublayer id. A web map edit or a service republish that
-removes or renumbers that sublayer leaves the id in the widget config. The
-builder shows no error, the app loads, and the widget does nothing when a user
-clicks it in production.
+removes that sublayer id leaves the id in the widget config. The builder shows
+no error, the app loads, and the widget does nothing when a user clicks it in
+production. A renumber that gives the old id to another layer still resolves:
+this tool checks that an id exists, not which layer it names.
 
 This tool reads the app configuration, collects the value of every key that
 holds a data source id, and checks each one against the data sources the app
@@ -89,6 +90,14 @@ VIEW_KEYS = ("leadingLayersId", "trailingLayersId", "showJimuLayerViewIds",
              "hiddenJimuLayerViewIds")
 VIEW_MAPS = ("swipeMapViewList", "customizeLayerOptions")
 
+# Why an entry is INERT: a reference no widget reads, which fails nothing.
+MAP_TABLE = ("The table is in MAP mode, so this entry makes no tab. If the "
+             "layer was renumbered, its new tab lost the settings in this "
+             "entry")
+STALE_VIEW = ("No map widget in this app shows this map view, so the widget "
+              "never reads the settings kept under it. The builder leaves "
+              "them behind when a map widget changes its data source")
+
 # The shape Experience Builder gives the data source ids it generates. A
 # configInfo key is read as a data source id only when it has this shape or is
 # a declared data source, because other widgets key configInfo by other things.
@@ -146,10 +155,12 @@ class Unread(Exception):
 class Ref(object):
     """One data source id found in an app configuration."""
 
-    def __init__(self, dsid, path, owner, inert=False):
+    def __init__(self, dsid, path, owner, inert=""):
         self.dsid = dsid
         self.path = path
         self.owner = owner
+        # Why no widget reads this entry, or "". A DANGLING verdict on an
+        # inert reference is reported as INERT with this reason.
         self.inert = inert
 
 
@@ -418,6 +429,19 @@ def collect_refs(app):
     """
     datasources = app.get("dataSources") or {}
     found = []
+    # The map views that exist: <map widget id>-<data source id> for each
+    # data source a widget uses. A Swipe or Map Layers block keyed by any
+    # other map view is left over, and the widget reads only the block of a
+    # map view that exists (Esri's JimuLayerView).
+    views = set()
+    widgets = app.get("widgets")
+    for wid in widgets if isinstance(widgets, dict) else {}:
+        widget = widgets[wid] if isinstance(widgets[wid], dict) else {}
+        uses = widget.get("useDataSources")
+        for use in uses if isinstance(uses, list) else []:
+            if isinstance(use, dict) and isinstance(use.get("dataSourceId"),
+                                                    str):
+                views.add("%s-%s" % (wid, use["dataSourceId"]))
 
     def container(dsid):
         ds = datasources.get(dsid)
@@ -463,15 +487,23 @@ def collect_refs(app):
                             found.append(Ref(vid.split("-", 1)[-1], "%s[%d]"
                                              % (sub, pos), owner, inert))
                 if key in VIEW_MAPS and isinstance(value, dict):
+                    # A stale block is one INERT note at most. What is
+                    # inside it is never read, so it is not collected.
                     for vkey in value:
+                        stale = "" if vkey in views else STALE_VIEW
                         found.append(Ref(vkey.split("-", 1)[-1], "%s{%s}"
-                                         % (sub, vkey), owner, inert))
+                                         % (sub, vkey), owner,
+                                         inert or stale))
+                        if not stale:
+                            walk(value[vkey], "%s.%s" % (sub, vkey), owner,
+                                 inert)
+                    continue
                 # A table in MAP mode makes one tab per map layer and uses a
                 # layersConfig entry only for the layer whose id it names
                 # (read from the Table widget's code). A stale entry makes no
                 # tab, so it does not fail the run.
-                walk(value, sub, owner,
-                     inert or (table_map and key == "layersConfig"))
+                walk(value, sub, owner, inert or (
+                    MAP_TABLE if table_map and key == "layersConfig" else ""))
         elif isinstance(node, list):
             for pos, value in enumerate(node):
                 walk(value, "%s[%d]" % (path, pos), owner, inert)
@@ -481,9 +513,9 @@ def collect_refs(app):
         if isinstance(value, dict):
             for sub in value:
                 walk(value[sub], "%s.%s" % (key, sub),
-                     _owner(sub, value[sub]), False)
+                     _owner(sub, value[sub]), "")
         else:
-            walk(value, key, key, False)
+            walk(value, key, key, "")
     return found
 
 
@@ -587,10 +619,7 @@ def audit(surfaces, webmap_get, service_get):
     report.services_total = len(services)
     for name, ref, verdict in verdicts:
         if verdict.status == DANGLING and ref.inert:
-            verdict = Verdict(INERT, verdict.reason + ". The table is in MAP "
-                              "mode, so this entry makes no tab. If the layer "
-                              "was renumbered, its new tab lost the settings "
-                              "in this entry")
+            verdict = Verdict(INERT, "%s. %s" % (verdict.reason, ref.inert))
         report.findings.append((name, ref, verdict))
     for name, app, found in refs:
         report.surfaces.append((name, len(app["widgets"]), len(found)))
@@ -695,8 +724,8 @@ def describe(report):
         verdict = ("%d widget binding(s) point at a layer that does not "
                    "exist." % bound)
     elif report.count(INERT):
-        verdict = ("every widget binding resolves, but %d reference(s) in a "
-                   "MAP-mode table's layersConfig do not: see INERT."
+        verdict = ("every widget binding resolves, but %d reference(s) that "
+                   "no widget reads do not: see INERT."
                    % report.count(INERT))
     else:
         verdict = "every data source reference resolves."
@@ -734,9 +763,12 @@ def document(report, source):
 # ------------------------------------------------------------------ inputs
 
 def redact(text, secret):
+    """text without secret, raw or in either form a url gives it.
+    urlencode writes a space as +, quote writes it as %20."""
     if secret:
-        text = text.replace(secret, "***")
-        text = text.replace(urllib.parse.quote(secret, safe=""), "***")
+        for form in (secret, urllib.parse.quote(secret, safe=""),
+                     urllib.parse.quote_plus(secret, safe="")):
+            text = text.replace(form, "***")
     return text
 
 
@@ -822,26 +854,33 @@ def is_loopback(host):
     return host in ("127.0.0.1", "localhost", "::1")
 
 
-def sends_token(url, portal, trusted=()):
-    """May the portal token go to this url?
+def reads_host(url, portal, trusted=()):
+    """May online mode send any request to this url?
 
-    Only over https (or to this machine), and only to the portal's own host, a
-    host named with --trust-host, or, for ArcGIS Online, another arcgis.com
-    host, which is where an organization's hosted services live.
+    Only to the portal's own host, a host named with --trust-host, or, for
+    ArcGIS Online, another arcgis.com host, which is where an organization's
+    hosted services live. Service urls come from web map data, which anybody
+    can author. Fetched blindly, they would send this machine's requests to
+    any address it can reach, and print what came back.
     """
     try:
-        target = urllib.parse.urlparse(url)
-        host = (target.hostname or "").lower()
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
     except ValueError:
-        # A url urllib cannot parse gets no token. http_json then reports
-        # it unread.
-        return False
-    if target.scheme != "https" and not is_loopback(host):
+        # A url urllib cannot parse is not fetched, and gets no token.
         return False
     home = (urllib.parse.urlparse(portal).hostname or "").lower()
     if host == home or host in trusted:
         return True
     return host.endswith(".arcgis.com") and home.endswith(".arcgis.com")
+
+
+def sends_token(url, portal, trusted=()):
+    """May the portal token go to this url? Only to a host reads_host
+    accepts, and only over https or to this machine."""
+    if not reads_host(url, portal, trusted):
+        return False
+    target = urllib.parse.urlparse(url)
+    return target.scheme == "https" or is_loopback(target.hostname)
 
 
 def rest_root(portal):
@@ -932,8 +971,8 @@ def _parse(argv):
                          % TOKEN_ENV)
     ap.add_argument("--trust-host", dest="trust_host", action="append",
                     default=[], metavar="HOST",
-                    help="another host the token may be sent to, such as a "
-                         "federated server. Repeatable.")
+                    help="another host to read services from and send the "
+                         "token to, such as a federated server. Repeatable.")
     ap.add_argument("--out", metavar="FILE", help="path for a JSON report")
     ap.add_argument("--apply", action="store_true",
                     help="write --out. Without this nothing is written.")
@@ -1012,6 +1051,9 @@ def _online(args, token):
         return sends_token(url, args.portal, trusted)
 
     def get(url, bust=False):
+        if not reads_host(url, args.portal, trusted):
+            raise Unread("not on the portal's host or a host named with "
+                         "--trust-host, so it was not fetched")
         secret = token if token and token_ok(url) else None
         return http_json(url, secret, referer, bust, redirect_ok=token_ok)
 
@@ -1042,7 +1084,17 @@ def main(argv=None, environ=None):
                       "--self-test to verify the tool without them.")
     if args.apply and not args.out:
         return _usage("--apply needs --out")
-    token = args.token or environ.get(TOKEN_ENV) or None
+    if args.out and os.path.exists(args.out):
+        # The saved app JSON is often the only copy from before an edit.
+        # A spec such as ITEMID=FILE is tried whole and after its "=".
+        for spec in [args.app, args.resource] + args.webmap + args.service:
+            for path in [spec] + (spec or "").split("=", 1)[1:]:
+                if (path and os.path.exists(path)
+                        and os.path.samefile(path, args.out)):
+                    return _usage("--out %s is one of the inputs, and the "
+                                  "report would replace it" % args.out)
+    # Stripped: `set DEADWIDGET_TOKEN=abc ` on Windows keeps the space.
+    token = (args.token or environ.get(TOKEN_ENV) or "").strip() or None
     if online:
         if not args.portal or not args.item:
             return _usage("online mode needs both --portal and --item")
@@ -1283,6 +1335,13 @@ def self_test():
     check(report.services_read == 6 and report.services_total == 6,
           "it read the six services a reference needed")
     check(report.webmaps_read == 1, "and the one web map the app names")
+    shifted = copy(services)
+    shifted[base + "/Planning/Zoning/MapServer"] = {"layers": [
+        {"id": n, "name": "Parcels" if n == 15 else "Zoning %d" % n}
+        for n in range(16)]}
+    check(exit_code(run(app, webmap, shifted)) == 0,
+          "a republish that gives id 15 to another layer still reads ok: "
+          "the tool checks that an id exists, not what it names (Limits)")
 
     # ---- trap (b): whole ids at dash boundaries, never substrings
     wm = copy(webmap)
@@ -1718,34 +1777,59 @@ def self_test():
         "swipeMapViewList": {view: {
             "leadingLayersId": [view + "-18f00000099-layer-1", 5],
             "trailingLayersId": [view + "-18f00000001-layer-25-15"]}}}}
+    # widget_1-dataSource_4 is a map view the map widget left behind when
+    # it moved to dataSource_1. The builder keeps its block.
+    old = "widget_1-dataSource_4"
     swipe["widgets"]["widget_8"] = {"label": "Map Layers", "config": {
-        "customizeLayerOptions": {"widget_1-dataSource_4": {
+        "customizeLayerOptions": {view: {
             "showJimuLayerViewIds": [view + "-Group_5-18f00000004-layer-6"],
-            "hiddenJimuLayerViewIds": [view + "-18f00000003-layer-4"]}}}}
-    found = [(r.dsid, r.path.split(".config.")[1]) for r in
-             collect_refs(swipe) if r.owner.startswith(("widget_7",
-                                                        "widget_8"))]
+            "hiddenJimuLayerViewIds": [view + "-18f00000003-layer-4"]},
+            old: {"showJimuLayerViewIds": [old + "-L1", old + "-L2"]}}}}
+    refs = [r for r in collect_refs(swipe)
+            if r.owner.startswith(("widget_7", "widget_8"))]
+    found = [(r.dsid, r.path.split(".config.")[1]) for r in refs]
     check(found == [
         ("dataSource_1", "swipeMapViewList{%s}" % view),
         ("dataSource_1-18f00000099-layer-1",
          "swipeMapViewList.%s.leadingLayersId[0]" % view),
         ("dataSource_1-18f00000001-layer-25-15",
          "swipeMapViewList.%s.trailingLayersId[0]" % view),
-        ("dataSource_4", "customizeLayerOptions{widget_1-dataSource_4}"),
+        ("dataSource_1", "customizeLayerOptions{%s}" % view),
         ("dataSource_1-Group_5-18f00000004-layer-6", "customizeLayerOptions."
-         "widget_1-dataSource_4.showJimuLayerViewIds[0]"),
+         "%s.showJimuLayerViewIds[0]" % view),
         ("dataSource_1-18f00000003-layer-4", "customizeLayerOptions."
-         "widget_1-dataSource_4.hiddenJimuLayerViewIds[0]")],
+         "%s.hiddenJimuLayerViewIds[0]" % view),
+        ("dataSource_4", "customizeLayerOptions{%s}" % old)],
           "Swipe and Map Layers layer view ids and map view keys are "
           "collected, each with its widget id stripped  <-- pinned defect")
+    check([r.inert for r in refs] == [""] * 6 + [STALE_VIEW],
+          "a block for a map view the map widget no longer shows is one "
+          "inert key, and nothing inside it is collected  <-- pinned defect")
     report = run(swipe, webmap)
     got = statuses(report)
     check(got["dataSource_1-18f00000099-layer-1"] == DANGLING and
-          got["dataSource_4"] == DANGLING and
+          got["dataSource_4"] == INERT and
           got["dataSource_1-18f00000001-layer-25-15"] == OK and
           exit_code(report) == 1,
-          "a Swipe layer the web map lost, and a Map Layers view of a data "
-          "source the app lost, exit 1, not a clean 0  <-- pinned defect")
+          "a Swipe layer the web map lost exits 1, not a clean 0  "
+          "<-- pinned defect")
+    del swipe["widgets"]["widget_7"]
+    swipe["widgets"]["widget_9"] = {"label": "Swipe", "config": {
+        "swipeMapViewList": {"widget_1-dataSource_3": {
+            "leadingLayersId": ["widget_1-dataSource_3-L5"]}}}}
+    report = run(swipe, webmap)
+    lines = describe(report)
+    check(exit_code(report) == 0 and report.count(INERT) == 2 and
+          report.count(DANGLING) == 0 and lines[-1] == "VERDICT: every "
+          "widget binding resolves, but 2 reference(s) that no widget reads "
+          "do not: see INERT." and [x for x in lines if STALE_VIEW in x],
+          "a stale Map Layers or Swipe block the builder left behind is one "
+          "INERT note each and exits 0, not N DANGLING and 1  "
+          "<-- pinned defect")
+    check(collect_refs({"widgets": {"w": 5, "v": {"useDataSources": [
+        5, {"dataSourceId": 7}]}}, "dataSources": {}}) == [],
+          "a widget or a useDataSources entry of the wrong type names no "
+          "map view and no reference, and does not crash")
     got = run(app, webmap)
     inert = [r for _, r, _ in got.findings if r.inert]
     check(len(inert) == 3 and all("layersConfig" in r.path for r in inert),
@@ -1982,7 +2066,7 @@ def self_test():
         "useDataSource"] = {"dataSourceId": "dataSource_1-18f00000003-layer-9"}
     lines = describe(run(stale, webmap))
     check(lines[-1] == "VERDICT: every widget binding resolves, but 1 "
-          "reference(s) in a MAP-mode table's layersConfig do not: see INERT."
+          "reference(s) that no widget reads do not: see INERT."
           and "every data source reference resolves" not in "\n".join(lines),
           "an INERT reference is not called resolved  <-- pinned defect")
     check([x for x in lines if "so this entry makes no tab. If the layer was "
@@ -2006,6 +2090,9 @@ def self_test():
           "and one that already ends in sharing/rest is not doubled")
     check(redact("a tok+en/x b tok%2Ben%2Fx", "tok+en/x") == "a *** b ***",
           "a token is redacted raw and url-quoted")
+    check(redact("t=a+b%2F u=a%20b%2F v=a b/", "a b/") == "t=*** u=*** v=***",
+          "a token with a space is redacted in both url forms  "
+          "<-- pinned defect")
     check(redact("x", None) == "x", "and nothing is redacted with no token")
     portal = "https://org.maps.arcgis.com"
     check(sends_token("https://org.maps.arcgis.com/x", portal),
@@ -2032,6 +2119,11 @@ def self_test():
           "and never over plain http  <-- pinned defect")
     check(sends_token("http://127.0.0.1:1/x", "http://127.0.0.1:1"),
           "except to this machine")
+    check(reads_host("https://org.maps.arcgis.com:6443/x", portal) and
+          reads_host("http://gis.example.com/x", portal, {"gis.example.com"})
+          and not reads_host("http://10.0.0.5/x/MapServer", portal),
+          "online mode reads the portal's host on any port and a trusted "
+          "host, and nothing a web map merely names  <-- pinned defect")
     check(bind_webmaps(["wm.json"], {wm_id}) == {wm_id: "wm.json"},
           "one unnamed web map file binds to the app's one web map")
     check(bind_webmaps(["%s=a.json" % wm_id, "b.json"], {wm_id, "b" * 32})
@@ -2252,6 +2344,23 @@ def self_test():
     check(code == 1 and written["counts"]["dangling"] == 2 and
           written["source"] == broken_file,
           "--out with --apply writes the JSON report and keeps the exit code")
+    code, out, err = run_cli([broken_file, "--webmap", wm_file,
+                              "--out", report_file, "--apply"] + svc_args)
+    check(code == 1 and "wrote" in out,
+          "and a later run replaces its own earlier report")
+    inputs = [broken_file, moved_file, wm_file,
+              svc_args[1].split("=", 1)[1]]
+    kept = [read_json_file(path) for path in inputs]
+    codes = [run_cli([broken_file, "--resource", moved_file, "--webmap",
+                      "%s=%s" % (wm_id, wm_file), "--out",
+                      os.path.join(os.path.dirname(path), ".",
+                                   os.path.basename(path)), "--apply"]
+                     + svc_args)[0] for path in inputs]
+    check(codes == [64] * 4 and
+          [read_json_file(path) for path in inputs] == kept,
+          "--out naming the app, the draft, a web map or a service file, "
+          "however it is spelled, is refused and the input is kept  "
+          "<-- pinned defect")
     code, out, err = run_cli([broken_file, "--webmap", wm_file, "--out",
                               os.path.join(tmp, "no", "dir", "r.json"),
                               "--apply"] + svc_args)
@@ -2342,22 +2451,24 @@ def self_test():
                 routes[urllib.parse.urlsplit(url).path] = (200, body)
 
         online = ["--portal", live + "/", "--item", app_id]
+        # The Hydrants service sits on localhost, a host the web map names
+        # and the command line does not.
+        trusting = online + ["--trust-host", "localhost"]
         reset()
         code, out, err = run_cli(online + ["--token", token])
         check(server.server_address[0] == "127.0.0.1",
               "the stand-in portal is bound to the loopback address only")
-        check(code == 0 and "builder draft, 6 widget(s)" in out,
-              "online: the clean app, its resource, web map and services "
-              "exit 0")
-        check(len(seen) == 9, "online: nine requests, two copies, one web "
-                              "map and six services")
+        check(code == 2 and "UNJUDGED" in out and "a host named with "
+              "--trust-host, so it was not fetched" in out,
+              "online: a service on a host nobody named on the command line "
+              "is UNJUDGED, exit 2, and the reason names --trust-host")
+        check(len(seen) == 8 and not [s for s in seen
+                                      if s[0].startswith("localhost")],
+              "online: and no request at all goes to a host that only web "
+              "map data names  <-- pinned defect")
         portal_hits = [s for s in seen if s[0].startswith("127.0.0.1")]
         check(all(s[2].get("token") == token for s in portal_hits),
               "online: every request to the portal host carries the token")
-        other = [s for s in seen if s[0].startswith("localhost")]
-        check(len(other) == 1 and "token" not in other[0][2],
-              "online: the service on another host gets no token  "
-              "<-- pinned defect")
         res = [s for s in seen if s[1].endswith("config.json")][0]
         check(res[3] == "no-cache" and "_ts" in res[2],
               "online: the resource read is cache-busted")
@@ -2373,17 +2484,23 @@ def self_test():
         code, out, err = run_cli(online + ["--token", token, "--trust-host",
                                            "LOCALHOST"])
         other = [s for s in seen if s[0].startswith("localhost")]
-        check(code == 0 and other[0][2].get("token") == token,
-              "online: --trust-host lets the token reach a named host")
+        check(code == 0 and "builder draft, 6 widget(s)" in out,
+              "online: with that host trusted, the clean app, its resource, "
+              "web map and services exit 0")
+        check(len(seen) == 9, "online: nine requests, two copies, one web "
+                              "map and six services")
+        check(len(other) == 1 and other[0][2].get("token") == token,
+              "online: --trust-host lets the request and the token reach a "
+              "named host")
         reset(resource={"widgets": {}, "dataSources": {}})
-        code, out, err = run_cli(online)
+        code, out, err = run_cli(trusting)
         check(code == 0 and "DIVERGED" in out,
               "online: a draft that lost its bindings diverges, exit 0")
         report_file = os.path.join(tmp, "online.json")
         reset(resource={"error": {"code": 403, "message":
                                   "Not allowed with token %s" % token}})
         code, out, err = run_cli(online + ["--out", report_file, "--apply"],
-                                 env=token)
+                                 env=token + " ")
         with io.open(report_file, encoding="ascii") as handle:
             raw = handle.read()
         check(code == 2 and "Not allowed with token ***" in out,
@@ -2391,7 +2508,8 @@ def self_test():
               "redacted  <-- pinned defect")
         check(all(s[2].get("token") == token for s in seen
                   if s[0].startswith("127.0.0.1")),
-              "online: the token is read from %s" % TOKEN_ENV)
+              "online: the token is read from %s, without the trailing "
+              "space a Windows set line leaves  <-- pinned defect" % TOKEN_ENV)
         check(token not in raw and "item %s" % app_id in raw and
               "Not allowed with token ***" in raw,
               "online: the report file names the item and holds no token  "
@@ -2412,7 +2530,7 @@ def self_test():
         routes[urllib.parse.urlsplit(
             live + "/server/rest/services/Planning/Zoning/MapServer").path] = (
             500, "boom")
-        code, out, err = run_cli(online)
+        code, out, err = run_cli(trusting)
         check(code == 2 and "UNJUDGED" in out,
               "online: a service answering 500 leaves its sublayers UNJUDGED")
         reset()
@@ -2441,6 +2559,11 @@ def self_test():
                      "a url urllib refuses is unread, not a crash", Unread)
         check("Zq9" not in "%s" % exc and "***" in "%s" % exc,
               "and urllib's error, which quotes the whole url, is redacted  "
+              "<-- pinned defect")
+        exc = raises(lambda: http_json(live + "/a b", token="Zq9 x/"),
+                     "and so is one whose token holds a space", Unread)
+        check("Zq9" not in "%s" % exc and "***" in "%s" % exc,
+              "and the token's + for a space is redacted too  "
               "<-- pinned defect")
         # Port 1 on the loopback address: if a check below ever lets the
         # request through, it fails fast with another message.
@@ -2498,17 +2621,18 @@ def self_test():
                              and s[2].get("token") == token],
               "online: and it follows one to a trusted host")
         relayed()
-        code, out, err = run_cli(online)
+        code, out, err = run_cli(trusting)
         check(code == 0 and [s for s in seen if s[0].startswith("localhost")
                              and s[1].endswith("Water/MapServer")],
               "online: and a read with no token follows the redirect")
         reset()
         hostile = copy(o_wm)
-        hostile["operationalLayers"][1]["url"] = "file:///etc/MapServer"
+        hostile["operationalLayers"][1]["url"] = (
+            "file://127.0.0.1/etc/MapServer")
         routes[rest + wm_id + "/data"] = (200, hostile)
-        code, out, err = run_cli(online)
-        check(code == 2 and "service file:///etc/MapServer could not be read"
-              in out and "only http and https" in out,
+        code, out, err = run_cli(trusting)
+        check(code == 2 and "service file://127.0.0.1/etc/MapServer could "
+              "not be read" in out and "only http and https" in out,
               "online: a web map layer with a file: url leaves its sublayers "
               "UNJUDGED and fetches nothing  <-- pinned defect")
     finally:
