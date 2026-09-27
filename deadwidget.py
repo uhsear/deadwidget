@@ -36,7 +36,6 @@ from __future__ import print_function
 
 import argparse
 import atexit
-import gc
 import http.server
 import importlib.util
 import io
@@ -52,7 +51,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import warnings
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -898,8 +896,11 @@ class _Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse exits 2 on a usage error, and 2 here means "an input could
         # not be read". A typo must not look like an unreachable portal.
-        self.print_usage(sys.stderr)
-        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+        # say(), not argparse's own print, so a missing or dead stderr cannot
+        # turn the 64 into a traceback's 1.
+        say(self.format_usage().rstrip("\n"), True)
+        say("%s: error: %s" % (self.prog, message), True)
+        self.exit(64)
 
 
 def _parse(argv):
@@ -941,18 +942,31 @@ def _parse(argv):
     return ap.parse_args(argv)
 
 
-def say(text, stream=None):
+def say(text, err=False):
     """Print one line of printable ASCII. A scheduled job on Windows redirects
     stdout as cp1252, and a widget label outside it would crash the report
     halfway. A control character comes out as \\xNN, so text from a config
-    or a portal cannot move the cursor or start a line of its own."""
+    or a portal cannot move the cursor or start a line of its own.
+
+    A stream is None under pythonw or with its fd closed, and then nothing is
+    printed. A failed write to stdout raises, so the run reports it and exits
+    2. A failed write to stderr is dropped: nothing is left to report it to.
+    """
     text = CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
-    print(text.encode("ascii", "backslashreplace").decode("ascii"),
-          file=stream or sys.stdout)
+    stream = sys.stderr if err else sys.stdout
+    if stream is None:
+        return
+    try:
+        print(text.encode("ascii", "backslashreplace").decode("ascii"),
+              file=stream)
+    except OSError:
+        if not err:
+            raise
+        drop(stream)
 
 
 def _usage(message):
-    say("error: %s" % message, sys.stderr)
+    say("error: %s" % message, True)
     return 64
 
 
@@ -1057,18 +1071,27 @@ def main(argv=None, environ=None):
         # crash on input nobody foresaw must never leave with it.
         say("error: deadwidget could not complete, so this run proves "
             "nothing: %s: %s" % (type(exc).__name__, redact("%s" % exc, token)),
-            sys.stderr)
+            True)
         return 2
 
 
+def drop(stream):
+    """Point a dead stream's fd at devnull, or the flush at exit fails again
+    and Python turns the exit code into 120."""
+    null = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(null, stream.fileno())
+    os.close(null)
+
+
 def flushed(code, stream):
-    """code, or 2 when the reader of the output went away, as with | head."""
+    """code, or 2 when the reader of the output went away, as with | head.
+    A stream that is None was never there, so it cannot have gone away."""
+    if stream is None:
+        return code
     try:
         stream.flush()
     except OSError:
-        # Point the stream at devnull, or the flush at exit fails again and
-        # Python turns the exit code into 120.
-        os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+        drop(stream)
         return 2
     return code
 
@@ -1091,7 +1114,7 @@ def _run(args, token, surfaces, webmap_get, service_get, source):
             with io.open(args.out, "w", encoding="ascii") as handle:
                 handle.write(text + "\n")
         except (IOError, OSError) as exc:
-            say("error: could not write %s: %s" % (args.out, exc), sys.stderr)
+            say("error: could not write %s: %s" % (args.out, exc), True)
             return 2
         say("")
         say("wrote %s" % args.out)
@@ -1564,6 +1587,9 @@ def self_test():
     odd["dataSource_3"] = {"type": "WEB_MAP", "itemId": wm_id}
     check(webmap_items({"dataSources": odd}) == set([wm_id]),
           "and only string item ids are fetched  <-- pinned defect")
+    odd["dataSource_4"] = {"type": "FEATURE_LAYER", "itemId": "f" * 32}
+    check(webmap_items({"dataSources": odd}) == set([wm_id]),
+          "and a hosted feature layer's item id is not taken for a web map")
     check(member(svc_url, "0", {svc_url: "boom"}, "x").status == UNJUDGED,
           "a service remembered as unreadable stays UNJUDGED")
     got = judge("dataSource_1-18f00000006-layer-8", app["dataSources"],
@@ -1583,6 +1609,10 @@ def self_test():
           "a configInfo key that is a data source id is collected")
     check(not [p for p in paths if "someOtherKey" in p],
           "and a configInfo key of another shape is not")
+    named = {"widgets": {"w": {"config": {"configInfo": {"parcels": {}}}}},
+             "dataSources": {"parcels": {"type": "FEATURE_LAYER"}}}
+    check([r.dsid for r in collect_refs(named)] == ["parcels"],
+          "unless the app declares it as a data source id")
     gone = copy(app)
     gone["widgets"]["widget_3"]["config"]["configInfo"] = {"dataSource_3": {}}
     got = statuses(run(gone, webmap))
@@ -2130,19 +2160,50 @@ def self_test():
         def flush(self):
             raise BrokenPipeError(32, "Broken pipe")
 
+        def write(self, text):
+            raise BrokenPipeError(32, "Broken pipe")
+
         def fileno(self):
             return self.fd
+    small = put("small.json", {"widgets": {"w": {"useDataSources": [
+        {"dataSourceId": "dataSource_9"}]}}, "dataSources": {}})
+    clean = put("clean.json", {"widgets": {"w": {"useDataSources": [
+        {"dataSourceId": "dataSource_2"}]}}, "dataSources": {
+            "dataSource_2": {"type": "FEATURE_LAYER"}}})
     sink = os.open(os.path.join(tmp, "sink"), os.O_WRONLY | os.O_CREAT)
+    saved = sys.stdout, sys.stderr
     try:
         check(flushed(1, Gone(sink)) == 2 and flushed(1, io.StringIO()) == 1,
               "output cut off by | head exits 2, not 1 or 120  "
               "<-- pinned defect")
+        # 2>&1 | head: the error line about the dead stdout goes to the same
+        # dead pipe, and that second failure must not escape main.
+        sys.stdout = sys.stderr = Gone(sink)
+        code = main([small])
+        code = flushed(code, sys.stdout)
+        sys.stdout, sys.stderr = saved
+        check(code == 2, "and so does 2>&1 | head, where stderr is the same "
+              "dead pipe  <-- pinned defect")
+        # pythonw, or a closed fd 1 or 2, leaves the stream None.
+        sys.stdout = sys.stderr = None
+        codes = [flushed(main([arg]), sys.stdout)
+                 for arg in (clean, small, os.path.join(tmp, "absent.json"))]
+        try:
+            main([clean, "--bogus"])
+        except SystemExit as exc:
+            codes.append(exc.code)
+        sys.stdout = io.StringIO()
+        codes.append(_usage("x"))
+        codes.append(sys.stdout.getvalue())
     finally:
+        sys.stdout, sys.stderr = saved
         os.close(sink)
+    check(codes == [0, 1, 2, 64, 64, ""], "with no stdout or stderr at all, "
+          "as under pythonw, each exit code stands and none becomes a "
+          "traceback's 1, and no error line strays into stdout  "
+          "<-- pinned defect")
     # The 120 comes from the flush at interpreter shutdown, so only a real
     # process can show it. Its pipe has no reader from the start.
-    small = put("small.json", {"widgets": {"w": {"useDataSources": [
-        {"dataSourceId": "dataSource_9"}]}}, "dataSources": {}})
     reader, writer = os.pipe()
     os.close(reader)
     try:
@@ -2153,6 +2214,20 @@ def self_test():
         os.close(writer)
     check(code == 2, "and a real run whose reader is gone exits 2 at "
           "shutdown, not 1 or 120  <-- pinned defect")
+    # A report larger than the pipe buffer fails mid-run, not at shutdown.
+    big = put("big.json", {"widgets": dict(
+        ("w%d" % n, {"useDataSources": [{"dataSourceId": "dataSource_%d" % n}]})
+        for n in range(400)), "dataSources": {}})
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        code = subprocess.call([sys.executable, os.path.abspath(__file__),
+                                big], stdout=writer, stderr=writer,
+                               timeout=60)
+    finally:
+        os.close(writer)
+    check(code == 2, "and so does a real 2>&1 run cut off mid-report  "
+          "<-- pinned defect")
     bad = put("bad.json", None, raw="{not json")
     check(run_cli([bad])[0] == 2, "offline: an app file that is not JSON "
           "exits 2")
@@ -2196,6 +2271,9 @@ def self_test():
           "--portal without --item is a usage error that names the fix")
     check(run_cli(["--portal", "ftp://x", "--item", app_id])[0] == 64,
           "a portal url that is not http is refused")
+    code, out, err = run_cli(["--portal", "https://[x", "--item", app_id])
+    check(code == 64 and "not a valid url" in err,
+          "and so is one urllib cannot parse, before any request")
     check(run_cli(["--portal", "https://x", "--item", "abc"])[0] == 64,
           "a truncated item id is refused before any request")
     code, out, err = run_cli(["--portal", "http://gis.example.com", "--item",
@@ -2377,19 +2455,20 @@ def self_test():
                   "and it is refused before any request is made  "
                   "<-- pinned defect")
         routes["/hop/MapServer"] = (302, "ftp://127.0.0.1:1/pub/MapServer")
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            exc = raises(lambda: http_json(live + "/hop/MapServer"),
-                         "a redirect to an ftp url is unread", Unread)
-            check("redirect to a url that is not http or https was refused"
-                  in "%s" % exc, "and the ftp url is never opened  "
-                  "<-- pinned defect")
-            del exc
-            gc.collect()
-        check(not [w for w in caught
-                   if issubclass(w.category, ResourceWarning)],
-              "and the refused response is closed, not left open for the "
-              "garbage collector  <-- pinned defect")
+        exc = raises(lambda: http_json(live + "/hop/MapServer"),
+                     "a redirect to an ftp url is unread", Unread)
+        check("redirect to a url that is not http or https was refused"
+              in "%s" % exc, "and the ftp url is never opened  "
+              "<-- pinned defect")
+        # A collected response never warns, so the close is checked on the
+        # handler itself.
+        body = io.BytesIO(b"")
+        raises(lambda: WebOnlyRedirect().redirect_request(
+            urllib.request.Request(live), body, 302, "Found", {},
+            "ftp://127.0.0.1:1/x"), "the handler refuses the ftp redirect",
+            urllib.error.HTTPError)
+        check(body.closed, "and closes the refused response, which urllib "
+              "leaves open  <-- pinned defect")
         routes["/hop/MapServer"] = (302, live + "/big")
         check(http_json(live + "/hop/MapServer") == 12345678901234567890,
               "a redirect to another http url is still followed")

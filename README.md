@@ -65,6 +65,8 @@ PASS  a label outside ASCII is printed escaped, so a cp1252 stdout cannot crash 
 PASS  a label's control characters are printed escaped, so it cannot drive the terminal or forge a VERDICT line  <-- pinned defect
 PASS  a crash nobody foresaw exits 2, never 1, and is redacted  <-- pinned defect
 PASS  output cut off by | head exits 2, not 1 or 120  <-- pinned defect
+PASS  and so does 2>&1 | head, where stderr is the same dead pipe  <-- pinned defect
+PASS  with no stdout or stderr at all, as under pythonw, each exit code stands and none becomes a traceback's 1, and no error line strays into stdout  <-- pinned defect
 ...
 PASS  --out without --apply writes nothing at all  <-- pinned defect
 ...
@@ -91,17 +93,17 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-229 assertions, 0 failed
+249 assertions, 0 failed
 ```
 
-The full run prints all 229 assertions. The `...` lines above are where this block is cut.
+The full run prints all 249 assertions. The `...` lines above are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 229 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
+The same 249 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
 with `-W error`, and the three runs print identical output.
 Branch coverage of `deadwidget.py` under `--self-test` is 100 percent, with no line excluded.
 
@@ -181,9 +183,9 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 | Status | Meaning | Fails the run |
 |---|---|---|
 | `OK` | The id resolves to a layer that exists. | no |
-| `DANGLING` | The data source is not declared, the web map has no such layer, the web map's `layers` array omits the sublayer, or the service no longer publishes it. | exit 1 |
+| `DANGLING` | The data source is not declared, the web map has no such layer, a web map `layers` array that decides the sublayers omits the sublayer, or the service no longer publishes it. Limits says when the array decides. | exit 1 |
 | `UNJUDGED` | The web map or the service needed to decide could not be read. | exit 2 |
-| `INERT` | Dangling, but inside the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. This was read from the Table widget's code, and Limits gives the cost. The verdict gives the `INERT` count. | no |
+| `INERT` | Dangling, but inside the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. This was read from the Table widget's code, and Limits gives the cost. The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
 | `NOT AUDITED` | A child of a web scene, a widget output, a subtype group layer, a knowledge graph layer, a feature collection, or another type this tool does not model. Nothing checked it, so it is not clean. | exit 2 |
 
 **Two traps from the author's prototype.** Both are pinned in the self-test.
@@ -258,14 +260,15 @@ to all five requests and appeared in neither the output nor the report file.
 |---|---|
 | 0 | Every reference resolves in every copy the run audited. That is the published copy, and also the draft when `--resource` is given or the run is online. The copies can still diverge, which is reported. |
 | 1 | A reference is dangling in the published copy or in the draft. |
-| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does. |
+| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does, with or without `2>&1`. |
 | 64 | Usage error. |
 
 Exit 2 beats exit 1. A web map that could not be read is not a web map known to be clean, and a
 scheduled job that saw 0 or 1 would trust the answer. A reference that the tool does not audit
 is the same case. A widget bound to a deleted web scene layer is the failure this tool is for,
 so an app with a web scene exits 2 and never 0. For the same reason, an unexpected error
-exits 2 with a one-line message, and never 1 with a traceback.
+exits 2 with a one-line message, and never 1 with a traceback. A run with no stdout or stderr at
+all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exit codes.
 
 ## Online mode and the token
 
@@ -296,9 +299,12 @@ exits 2 with a one-line message, and never 1 with a traceback.
   was not measured on a real app, because the author's apps bind no widget to a group layer's
   child. The map service rule was measured: four references to nested sublayers on one real app
   all used the flat `<layer id>-<sublayer id>` form.
-- A sublayer that the service publishes and that the web map's `layers` array omits is reported as
-  dangling, because the browser builds a map service's sublayers from that array alone. This was
-  observed in the Layer List of a running app. It was not independently reproduced.
+- A web map `layers` array decides a map service's sublayers only when one of its entries carries
+  a `minScale`, directly or in its `layerDefinition`. The ArcGIS Maps SDK for JavaScript then builds
+  the sublayers from that array alone (`isSublayerOverhaul` in `@arcgis/core` `sublayerUtils.js`),
+  so a sublayer that the array omits is reported as dangling. Without a `minScale`, as Map Viewer
+  Classic writes the array, the array only overrides sublayers by id, and the service decides. This
+  rule was read from the SDK's code. It was not measured in a running app.
 - A table in `MAP` mode builds its tabs from the layers in the map. It applies a `layersConfig`
   entry only to the layer whose data source id the entry names. This comes from reading the Table
   widget's shipped code, and it was not measured in a running app. What was measured is only that
@@ -307,7 +313,9 @@ exits 2 with a one-line message, and never 1 with a traceback.
 - An `INERT` entry can still cost something. When a republish renumbers a sublayer, the new
   sublayer gets a tab, but that tab has lost the entry's search fields, columns and CSV export.
   The tool cannot tell a renumber from a removal. For that reason, a run with an `INERT` reference
-  never prints "every data source reference resolves", and the verdict gives the `INERT` count.
+  never prints "every data source reference resolves". The counts line always gives the `INERT`
+  count. The verdict gives it too when nothing else fails the run; otherwise the verdict names
+  only what failed the run.
 - Web scenes, subtype group layers, knowledge graph layers, feature collections and data views
   are not modelled. Their children are reported as `NOT AUDITED`, and the run exits 2. A
   reference to a data view, `<main id>-<view id>`, is judged through its main data source. The
