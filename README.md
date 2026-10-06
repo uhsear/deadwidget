@@ -43,11 +43,20 @@ PASS  when two map service ids both prefix a reference, the longer one owns it
 PASS  a sublayer id that is not a number is DANGLING even when the service could not be asked
 PASS  when two declared ids both prefix a reference, the longer one owns it
 PASS  a sublayer id that is not a number is DANGLING
+...
+PASS  a nested sublayer resolves as <layer>-<group>-<sublayer> and as <layer>-<sublayer>  <-- pinned defect
+...
+PASS  an app bound to a nested sublayer by its chain exits 0 after reading the service, not 1 unread  <-- pinned defect
+...
 PASS  a map service layer with no layers array resolves sublayer 2 from the service  <-- pinned defect
-PASS  and a nested service sublayer uses the flat <layer>-<sublayer> id
+PASS  and a nested service sublayer resolves by its own id, <layer>-<sublayer>
 PASS  and it is DANGLING once a republish drops sublayer 2 from the service
 PASS  a service that could not be read leaves its sublayers UNJUDGED, never ok  <-- pinned defect
 PASS  and the run exits 2, because unread is not clean  <-- pinned defect
+...
+PASS  a sublayer the layer item's scale-range array omits is DANGLING, although the web map has no layers array and the service publishes it  <-- pinned defect
+...
+PASS  a layer item that cannot be read leaves the sublayer UNJUDGED and the run exits 2, never 0  <-- pinned defect
 ...
 PASS  a child of a subtype group layer is NOT AUDITED, not DANGLING  <-- pinned defect
 PASS  a child of a feature collection is NOT AUDITED, not DANGLING  <-- pinned defect
@@ -58,6 +67,8 @@ PASS  a one-word suffix under a WEB_MAP main is a layer, not a data view, so it 
 PASS  a dangling reference in a top-level array is DANGLING, not inert  <-- pinned defect
 ...
 PASS  a stale Map Layers or Swipe block the builder left behind is one INERT note each and exits 0, not N DANGLING and 1  <-- pinned defect
+...
+PASS  a dangling reference beside layersConfig in a MAP-mode table's config is DANGLING, exit 1, not INERT  <-- pinned defect
 ...
 PASS  config/config.json is named the builder draft and the item data the published copy  <-- pinned defect
 PASS  a reference that is not audited makes the run incomplete, exit 2, even beside a dangling one  <-- pinned defect
@@ -77,9 +88,11 @@ PASS  with no stdout or stderr at all, as under pythonw, each exit code stands a
 ...
 PASS  --out without --apply writes nothing at all  <-- pinned defect
 ...
-PASS  --out naming the app, the draft, a web map or a service file, however it is spelled, is refused and the input is kept  <-- pinned defect
+PASS  --out naming the app, the draft, a web map, a service or a layer item file, however it is spelled, is refused and the input is kept  <-- pinned defect
 ...
 PASS  a file and a portal together are a usage error  <-- pinned defect
+...
+PASS  online: a plain http url on the portal host or a trusted host is read without the token, and an https one with it  <-- pinned defect
 ...
 PASS  online: and no request at all goes to a host that only web map data names  <-- pinned defect
 ...
@@ -95,6 +108,9 @@ PASS  and it is refused before any request is made  <-- pinned defect
 PASS  a network share url is unread
 PASS  and it is refused before any request is made  <-- pinned defect
 ...
+PASS  and it is refused before any request is made  <-- pinned defect
+...
+PASS  and it is refused before any request is made  <-- pinned defect
 PASS  a redirect to an ftp url is unread
 PASS  and the ftp url is never opened  <-- pinned defect
 ...
@@ -108,17 +124,17 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-260 assertions, 0 failed
+283 assertions, 0 failed
 ```
 
-The full run prints all 260 assertions. The `...` lines above are where this block is cut.
+The full run prints all 283 assertions. The `...` lines above are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 260 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
+The same 283 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
 with `-W error`, and the three runs print identical output.
 Branch coverage of `deadwidget.py` under `--self-test` is 100 percent, with no line excluded.
 
@@ -135,6 +151,7 @@ the tool the files:
 python deadwidget.py --self-test
 python deadwidget.py app.json --webmap webmap.json --service URL=service.json
 python deadwidget.py app.json --resource config.json --webmap ITEMID=webmap.json --service URL=service.json
+python deadwidget.py app.json --webmap webmap.json --service URL=service.json --layer-item ITEMID=item.json
 python deadwidget.py app.json --webmap webmap.json --out report.json --apply
 ```
 
@@ -146,6 +163,7 @@ The files come from these REST addresses:
 | `--resource` | `<portal>/sharing/rest/content/items/<app item id>/resources/config/config.json` |
 | `--webmap` | `<portal>/sharing/rest/content/items/<web map item id>/data?f=json` |
 | `--service` | `<MapServer or FeatureServer url>?f=json` |
+| `--layer-item` | `<portal>/sharing/rest/content/items/<Map Image Layer item id>/data?f=json` |
 
 Online, the tool reads all of these itself:
 
@@ -160,6 +178,7 @@ python deadwidget.py --portal https://org.maps.arcgis.com --item <app item id>
 | `--resource` | none | The app's `config/config.json` resource, which is the builder's draft. It is audited too, and compared with `APP_JSON`. |
 | `--webmap` | none | A web map's `/data` as `[ITEMID=]FILE`. Repeatable. The item id can be left out when the app names one web map. |
 | `--service` | none | A service description as `URL=FILE`. Repeatable. The tool names each url it needs. |
+| `--layer-item` | none | A Map Image Layer item's `/data` as `ITEMID=FILE`, for a web map layer added from that item. Repeatable. The tool names each item it needs. |
 | `--portal` | none | Portal url. Online mode. Must start with `https://` or `http://`. |
 | `--item` | none | The app's item id, 32 hexadecimal characters. Online mode. |
 | `--token` | none | A portal token. The `DEADWIDGET_TOKEN` environment variable is the better place for it. |
@@ -181,7 +200,8 @@ A web map's children are its layers, so the ids follow the layer tree:
 |---|---|
 | The web map | `dataSource_1`, as the app's `dataSources` object declares it |
 | A web map layer or table | `dataSource_1-<layer id>` |
-| A map service sublayer, at any depth | `dataSource_1-<layer id>-<sublayer id>` |
+| A map service sublayer | `dataSource_1-<layer id>-<sublayer id>` |
+| A nested map service sublayer | `dataSource_1-<layer id>-<sublayer id>`, or `dataSource_1-<layer id>-<group sublayer id>-<sublayer id>` |
 | A layer inside a group layer | `dataSource_1-<group id>-<layer id>` |
 | A layer of a feature service data source | `dataSource_9-<layer index>` |
 
@@ -198,16 +218,17 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 | Status | Meaning | Fails the run |
 |---|---|---|
 | `OK` | The id resolves to a layer that exists. | no |
-| `DANGLING` | The data source is not declared, the web map has no such layer, a web map `layers` array that decides the sublayers omits the sublayer, or the service no longer publishes it. Limits says when the array decides. | exit 1 |
-| `UNJUDGED` | The web map or the service needed to decide could not be read. | exit 2 |
+| `DANGLING` | The data source is not declared, the web map has no such layer, a `layers` array that decides the sublayers, in the web map or in the layer's item, omits the sublayer, or the service no longer publishes it. Limits says when the array decides. | exit 1 |
+| `UNJUDGED` | The web map, the service or the layer item needed to decide could not be read. | exit 2 |
 | `INERT` | Dangling, but in an entry that no widget reads. There are two such places. The first is the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. The second is a Swipe or Map Layers block kept for a map view that no longer exists (see below). The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
 | `NOT AUDITED` | A child of a web scene, a widget output, a subtype group layer, a knowledge graph layer, a feature collection, or another type this tool does not model. Nothing checked it, so it is not clean. | exit 2 |
 
 **Two traps from the author's prototype.** Both are pinned in the self-test.
 
 1. A map service layer with no `layers` array in the web map publishes every sublayer that the
-   service holds. A check that reads only the web map finds no sublayers there, and reports every
-   widget bound to one as dangling. This tool reads the service.
+   service holds, unless the layer's item decides them (see Limits). A check that reads only the
+   web map finds no sublayers there, and reports every widget bound to one as dangling. This tool
+   reads the service.
 2. `layer-25-1` is a substring of `layer-25-15`. A substring test found sixteen defects on one
    real app that did not exist. This tool compares whole ids, and every prefix match stops at a
    dash.
@@ -333,14 +354,22 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 
 - The group layer rule, `<group id>-<layer id>`, comes from Esri's documented composition rule. It
   was not measured on a real app, because the author's apps bind no widget to a group layer's
-  child. The map service rule was measured: four references to nested sublayers on one real app
-  all used the flat `<layer id>-<sublayer id>` form.
+  child. A nested map service sublayer was measured in two forms. Four references on one real app
+  used the flat `<layer id>-<sublayer id>` form. The saved configuration of another app used the
+  chain `<layer id>-<group sublayer id>-<sublayer id>`. The tool accepts both. It reads the
+  chain from the service's `parentLayerId` values, from the top-level group down.
 - A web map `layers` array decides a map service's sublayers only when one of its entries carries
   a `minScale`, directly or in its `layerDefinition`. The ArcGIS Maps SDK for JavaScript then builds
   the sublayers from that array alone (`isSublayerOverhaul` in `@arcgis/core` `sublayerUtils.js`),
   so a sublayer that the array omits is reported as dangling. Without a `minScale`, as Map Viewer
   Classic writes the array, the array only overrides sublayers by id, and the service decides. This
   rule was read from the SDK's code. It was not measured in a running app.
+- A map service layer added from a Map Image Layer item has a second such array: the item's
+  `/data`. The SDK tries the item first and the web map second, and the last array that decides
+  wins (`createSublayersForOrigin` in `@arcgis/core` `SublayersOwner.js`). So when the web map's
+  array does not decide, the tool reads the item's `/data` online, or takes it from `--layer-item`
+  offline. An item that no `--layer-item` file covers is unread, and the run exits 2. An item with
+  no data, or with no `minScale`, leaves the service to decide.
 - A table in `MAP` mode builds its tabs from the layers in the map. It applies a `layersConfig`
   entry only to the layer whose data source id the entry names. This comes from reading the Table
   widget's shipped code, and it was not measured in a running app. What was measured is only that

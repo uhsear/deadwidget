@@ -218,7 +218,13 @@ def service_root(url):
 
 
 def service_ids(doc):
-    """The layer and table ids a service description publishes, as strings."""
+    """The layer and table ids a service description publishes, as strings.
+
+    A nested sublayer is there twice: as its own id, 4, and as the chain
+    of ids from its top-level group down, 3-4. Experience Builder names a
+    nested sublayer both ways: one real app used the first form, and the
+    saved configuration of another used the second.
+    """
     problem = payload_error(doc)
     if problem:
         raise Unread(problem)
@@ -226,11 +232,24 @@ def service_ids(doc):
             isinstance(doc.get(key), list) for key in ("layers", "tables")):
         raise Unread("not a map or feature service description")
     ids = set()
+    parent = {}
     for key in ("layers", "tables"):
         entries = doc.get(key)
         for entry in entries if isinstance(entries, list) else []:
             if isinstance(entry, dict) and entry.get("id") is not None:
                 ids.add("%s" % (entry["id"],))
+                if entry.get("parentLayerId") is not None:
+                    parent["%s" % (entry["id"],)] = "%s" % (
+                        entry["parentLayerId"],)
+    for lid in list(ids):
+        chain = [lid]
+        up = parent.get(lid)
+        # A parent that is not published, such as -1, ends the chain, and
+        # so does a loop in a malformed description.
+        while up in ids and up not in chain:
+            chain.insert(0, up)
+            up = parent.get(up)
+        ids.add("-".join(chain))
     if not ids:
         # A secured service answers an anonymous read with an empty layer
         # list. Read as "publishes nothing", every sublayer bound to it would
@@ -238,6 +257,38 @@ def service_ids(doc):
         raise Unread("the service lists no layers and no tables, which is "
                      "what a secured service returns to an anonymous read")
     return frozenset(ids)
+
+
+def overhaul(doc):
+    """The sublayer ids a layers array decides, or None when it decides none.
+
+    doc is a web map layer or a Map Image Layer item's /data. The ArcGIS JS
+    API builds the sublayers from such an array alone only when an entry
+    carries a minScale (isSublayerOverhaul in @arcgis/core sublayerUtils.js).
+    Without one, as Map Viewer Classic writes it, the array only overrides
+    the service's sublayers by id, so the service decides. The web map is
+    tried after the item, and the last array that decides wins
+    (createSublayersForOrigin in @arcgis/core SublayersOwner.js).
+    """
+    subs = doc.get("layers") if isinstance(doc, dict) else None
+    subs = [s for s in subs if isinstance(s, dict)] \
+        if isinstance(subs, list) else []
+    if any(s.get("minScale") is not None or (
+            isinstance(s.get("layerDefinition"), dict) and
+            s["layerDefinition"].get("minScale") is not None)
+            for s in subs):
+        return frozenset("%s" % (s.get("id"),) for s in subs)
+    return None
+
+
+def item_data(doc):
+    """The sublayer ids a Map Image Layer item's /data decides, or an empty
+    set when it decides none. An item with no data answers with an empty
+    body, which http_json and read_json_file return as None."""
+    problem = payload_error(doc)
+    if problem:
+        raise Unread(problem)
+    return overhaul(doc) or frozenset()
 
 
 def index_webmap(doc):
@@ -249,8 +300,13 @@ def index_webmap(doc):
 
     A child data source id is the parent's id, a dash, and the child's own id
     (Esri's DataSourceConstructorOptions.jimuChildId). So a group layer's child
-    is <group>-<child>, and a map service sublayer is <layer>-<sublayer> at any
-    depth: nested sublayers were measured flat, with no group in between.
+    is <group>-<child>. A nested map service sublayer was measured in two
+    forms, <layer>-<sublayer> and <layer>-<group sublayer>-<sublayer>, and
+    service_ids publishes both.
+
+    A map service layer added from a Map Image Layer item gets its sublayers
+    from that item's /data when the web map's own array does not decide them,
+    so mapsvc names the item to read.
     """
     problem = payload_error(doc)
     if problem:
@@ -278,22 +334,12 @@ def index_webmap(doc):
             for child in children if isinstance(children, list) else []:
                 add(child, suffix + "-", "layer")
         elif ltype in MAPSVC_TYPES:
-            subs = layer.get("layers")
-            subs = [s for s in subs if isinstance(s, dict)] \
-                if isinstance(subs, list) else []
-            listed = None
-            if any(s.get("minScale") is not None or (
-                    isinstance(s.get("layerDefinition"), dict) and
-                    s["layerDefinition"].get("minScale") is not None)
-                    for s in subs):
-                # The ArcGIS JS API builds the sublayers from the web map's
-                # array alone only when an entry carries a minScale
-                # (isSublayerOverhaul in @arcgis/core sublayerUtils.js).
-                # Without one, as Map Viewer Classic writes it, the array only
-                # overrides the service's sublayers by id, so the service
-                # decides.
-                listed = frozenset("%s" % (s.get("id"),) for s in subs)
-            mapsvc[suffix] = {"title": title, "url": root, "listed": listed}
+            listed = overhaul(layer)
+            item = layer.get("itemId")
+            item = item if listed is None and isinstance(item, str) \
+                and ITEM_ID.match(item) else None
+            mapsvc[suffix] = {"title": title, "url": root, "listed": listed,
+                              "item": item}
         elif index is not None:
             entries[suffix]["check"] = (root, index)
 
@@ -346,12 +392,28 @@ def judge_child(child, index, services):
     sid = child[len(best) + 1:]
     layer = mapsvc[best]
     what = "sublayer %s of '%s'" % (sid, layer["title"])
-    if not sid.isdigit():
-        return Verdict(DANGLING, "%s: a sublayer id is a number" % what)
-    if layer["listed"] is not None and sid not in layer["listed"]:
-        return Verdict(DANGLING, "%s: the web map's layers array for this "
-                       "service sets scale ranges and omits it, so it never "
-                       "exists in the browser" % what)
+    chain = sid.split("-")
+    if not all(part.isdigit() for part in chain):
+        return Verdict(DANGLING, "%s: a sublayer id is a number, or a chain "
+                       "of numbers from a top-level group sublayer down"
+                       % what)
+    listed = layer["listed"]
+    source = "the web map's layers array for this service"
+    if layer["item"]:
+        key = ("item", layer["item"])
+        got = services.get(key)
+        if got is None:
+            return Verdict(UNJUDGED, "layer item %s has not been read"
+                           % layer["item"], key)
+        if isinstance(got, str):
+            return Verdict(UNJUDGED, "%s: its layer item %s could not be "
+                           "read: %s" % (what, layer["item"], got))
+        if got:
+            listed = got
+            source = "the layers array of its layer item %s" % layer["item"]
+    if listed is not None and not listed.issuperset(chain):
+        return Verdict(DANGLING, "%s: %s sets scale ranges and omits it, so it "
+                       "never exists in the browser" % (what, source))
     if not layer["url"]:
         return Verdict(UNJUDGED, "%s: the web map layer has no service url to "
                        "confirm it against" % what)
@@ -561,6 +623,8 @@ class Report(object):
         self.webmaps_total = 0
         self.services_read = 0
         self.services_total = 0
+        self.items_read = 0
+        self.items_total = 0
 
     def count(self, status):
         return sum(1 for f in self.findings if f[2].status == status)
@@ -570,8 +634,9 @@ class Report(object):
         return bool(self.only_data or self.only_resource)
 
 
-def audit(surfaces, webmap_get, service_get):
+def audit(surfaces, webmap_get, service_get, item_get):
     """Audit one app. surfaces is [(name, loader)]; loaders raise Unread.
+    item_get reads a Map Image Layer item's /data.
 
     Services are read only when a reference needs one, so a secured service
     nothing is bound to cannot fail the run.
@@ -609,14 +674,22 @@ def audit(surfaces, webmap_get, service_get):
                     need.add(verdict.need)
         if not need:
             break
-        for url in sorted(need):
+        # A need is a service url, or ("item", id) for a layer item.
+        for url in sorted(need, key=str):
+            item = url[1] if isinstance(url, tuple) else None
             try:
-                services[url] = service_ids(service_get(url))
-                report.services_read += 1
+                if item:
+                    services[url] = item_data(item_get(item))
+                    report.items_read += 1
+                else:
+                    services[url] = service_ids(service_get(url))
+                    report.services_read += 1
             except Unread as exc:
                 services[url] = "%s" % exc
-                report.unread.append(("service %s" % url, "%s" % exc))
-    report.services_total = len(services)
+                report.unread.append(("layer item %s" % item if item else
+                                      "service %s" % url, "%s" % exc))
+    report.items_total = len([u for u in services if isinstance(u, tuple)])
+    report.services_total = len(services) - report.items_total
     for name, ref, verdict in verdicts:
         if verdict.status == DANGLING and ref.inert:
             verdict = Verdict(INERT, "%s. %s" % (verdict.reason, ref.inert))
@@ -668,6 +741,9 @@ def describe(report):
     out.append("web maps read: %d of %d, services read: %d of %d"
                % (report.webmaps_read, report.webmaps_total,
                   report.services_read, report.services_total))
+    if report.items_total:
+        out[-1] += (", layer items read: %d of %d"
+                    % (report.items_read, report.items_total))
     for key, entry in grouped(report):
         _, dsid, owner, status, reason = key
         out.append("")
@@ -773,10 +849,13 @@ def redact(text, secret):
 
 
 def read_json_file(path):
-    """A JSON file, or Unread. utf-8-sig, because Windows tools write a BOM."""
+    """A JSON file, or Unread. utf-8-sig, because Windows tools write a BOM.
+    An empty file is None, as an empty response is: every reader but
+    item_data refuses None."""
     try:
         with io.open(path, "r", encoding="utf-8-sig") as handle:
-            return json.load(handle)
+            text = handle.read()
+        return json.loads(text) if text.strip() else None
     except (IOError, OSError, ValueError, RecursionError) as exc:
         raise Unread("%s: %s" % (path, exc))
 
@@ -820,7 +899,8 @@ def http_json(url, token=None, referer=None, bust=False,
     if len(raw) > limit:
         raise Unread("%s: larger than %d bytes, not read" % (url, limit))
     try:
-        return json.loads(raw.decode("utf-8-sig"))
+        text = raw.decode("utf-8-sig")
+        return json.loads(text) if text.strip() else None
     except (ValueError, RecursionError):
         raise Unread("%s: the response is not JSON" % url)
 
@@ -961,6 +1041,10 @@ def _parse(argv):
                     metavar="URL=FILE",
                     help="a service's ?f=json description saved as JSON. "
                          "Repeatable.")
+    ap.add_argument("--layer-item", dest="layer_item", action="append",
+                    default=[], metavar="ITEMID=FILE",
+                    help="a Map Image Layer item's /data saved as JSON, for a "
+                         "web map layer added from that item. Repeatable.")
     ap.add_argument("--portal", metavar="URL",
                     help="portal url (online mode), for example "
                          "https://org.maps.arcgis.com")
@@ -1011,8 +1095,15 @@ def _usage(message):
 
 def _offline(args):
     """Loaders for saved JSON files. Returns (surfaces, webmap_get,
-    service_get, source) or raises ValueError for a usage error."""
+    service_get, item_get, source) or raises ValueError for a usage error."""
     services = parse_services(args.service)
+    layer_items = {}
+    for spec in args.layer_item:
+        item, _, path = spec.partition("=")
+        if not path or not ITEM_ID.match(item):
+            raise ValueError("--layer-item takes ITEMID=FILE, where ITEMID is "
+                             "32 hexadecimal characters: %s" % spec)
+        layer_items[item] = path
     surfaces = [(DATA, lambda: read_json_file(args.app))]
     if args.resource:
         surfaces.append((RESOURCE, lambda: read_json_file(args.resource)))
@@ -1038,7 +1129,12 @@ def _offline(args):
             raise Unread("no --service file was given for this url")
         return read_json_file(services[url])
 
-    return surfaces, webmap_get, service_get, args.app
+    def item_get(item):
+        if item not in layer_items:
+            raise Unread("no --layer-item file was given for this item")
+        return read_json_file(layer_items[item])
+
+    return surfaces, webmap_get, service_get, item_get, args.app
 
 
 def _online(args, token):
@@ -1068,7 +1164,9 @@ def _online(args, token):
             raise Unread("not an item id, so it was not fetched")
         return get("%s/content/items/%s/data" % (rest, item))
 
-    return surfaces, webmap_get, get, "%s item %s" % (referer, args.item)
+    # A layer item's /data is read like a web map's.
+    return (surfaces, webmap_get, get, webmap_get,
+            "%s item %s" % (referer, args.item))
 
 
 def main(argv=None, environ=None):
@@ -1087,7 +1185,8 @@ def main(argv=None, environ=None):
     if args.out and os.path.exists(args.out):
         # The saved app JSON is often the only copy from before an edit.
         # A spec such as ITEMID=FILE is tried whole and after its "=".
-        for spec in [args.app, args.resource] + args.webmap + args.service:
+        for spec in ([args.app, args.resource] + args.webmap + args.service
+                     + args.layer_item):
             for path in [spec] + (spec or "").split("=", 1)[1:]:
                 if (path and os.path.exists(path)
                         and os.path.samefile(path, args.out)):
@@ -1148,9 +1247,9 @@ def flushed(code, stream):
     return code
 
 
-def _run(args, token, surfaces, webmap_get, service_get, source):
+def _run(args, token, surfaces, webmap_get, service_get, item_get, source):
     """Audit, print, and write the report file behind --apply."""
-    report = audit(surfaces, webmap_get, service_get)
+    report = audit(surfaces, webmap_get, service_get, item_get)
     for line in describe(report):
         say(redact(line, token))
     code = exit_code(report)
@@ -1302,7 +1401,8 @@ def self_test():
     base = "https://gis.example.com/server/rest/services"
     app, webmap, services = fixture(base)
 
-    def run(app_doc, webmap_doc=None, service_docs=None, resource=None):
+    def run(app_doc, webmap_doc=None, service_docs=None, resource=None,
+            items=None):
         docs = services if service_docs is None else service_docs
         surfaces = [(DATA, lambda: app_doc)]
         if resource is not None:
@@ -1317,7 +1417,18 @@ def self_test():
             if url not in docs:
                 raise Unread("no service")
             return docs[url]
-        return audit(surfaces, wm_get, svc_get)
+
+        def item_get(item):
+            if item not in (items or {}):
+                raise Unread("no layer item")
+            return items[item]
+        return audit(surfaces, wm_get, svc_get, item_get)
+
+    def only_map_of(item):
+        return {"widgets": {"widget_1": {"useDataSources": [
+            {"dataSourceId": "dataSource_1"}]}},
+            "dataSources": {"dataSource_1": {"type": "WEB_MAP",
+                                             "itemId": item}}}
 
     def statuses(report):
         return dict((ref.dsid, verdict.status)
@@ -1390,6 +1501,50 @@ def self_test():
           "owns it")
     check(judge_child("18f00000001-layer-25-abc", index, {}).status
           == DANGLING, "a sublayer id that is not a number is DANGLING")
+    # Group sublayer 3 holds 4; 4 holds 5. A chain names a nested sublayer
+    # from its top-level group down, as a second real app's config does.
+    tree = service_ids({"layers": [
+        {"id": 3, "parentLayerId": -1, "subLayerIds": [4]},
+        {"id": 4, "parentLayerId": 3, "subLayerIds": [5]},
+        {"id": 5, "parentLayerId": 4}, {"id": 0, "parentLayerId": -1}]})
+    check(tree == frozenset(["0", "3", "4", "5", "3-4", "3-4-5"]),
+          "a service publishes a nested sublayer by its own id and by the "
+          "chain from its top-level group")
+    chains = {svc_x: tree}
+    check([judge_child("X-layer-2-" + sid, nest, chains).status
+           for sid in ("3-4", "3-4-5", "4", "5")] == [OK] * 4,
+          "a nested sublayer resolves as <layer>-<group>-<sublayer> and as "
+          "<layer>-<sublayer>  <-- pinned defect")
+    check([judge_child("X-layer-2-" + sid, nest, chains).status
+           for sid in ("0-4", "4-5", "3-5", "3-4-9", "3-x")] == [DANGLING] * 5,
+          "a chain whose ids are not parent and child from the top down is "
+          "DANGLING")
+    check(service_ids({"layers": [{"id": 1, "parentLayerId": 2},
+                                  {"id": 2, "parentLayerId": 1}]})
+          == frozenset(["1", "2", "2-1", "1-2"]),
+          "a parent loop in a malformed service ends, and does not hang")
+    nested_app = {"widgets": {"w": {"useDataSources": [
+        {"dataSourceId": "dataSource_1-L-3-4",
+         "mainDataSourceId": "dataSource_1-L-3-4",
+         "rootDataSourceId": "dataSource_1"}]}},
+        "dataSources": {"dataSource_1": {"type": "WEB_MAP", "itemId": wm_id}}}
+    nested_wm = {"operationalLayers": [
+        {"id": "L", "layerType": "ArcGISMapServiceLayer", "url": svc_x}]}
+    tree_doc = {"layers": [{"id": 3, "parentLayerId": -1},
+                           {"id": 4, "parentLayerId": 3}]}
+    report = run(nested_app, nested_wm, {svc_x: tree_doc})
+    check(exit_code(report) == 0 and report.services_read == 1,
+          "an app bound to a nested sublayer by its chain exits 0 after "
+          "reading the service, not 1 unread  <-- pinned defect")
+    report = run(nested_app, nested_wm, {svc_x: {"layers": [
+        {"id": 3, "parentLayerId": -1}, {"id": 4, "parentLayerId": -1}]}})
+    check(exit_code(report) == 1,
+          "and exits 1 once a republish moves sublayer 4 out of group 3")
+    wm = copy(nested_wm)
+    wm["operationalLayers"][0]["layers"] = [{"id": 4, "minScale": 0}]
+    check(statuses(run(nested_app, wm, {svc_x: tree_doc}))[
+        "dataSource_1-L-3-4"] == DANGLING,
+          "a scale-range layers array that omits the group omits the chain")
 
     # ---- trap (a): a map service with no layers array publishes what the
     # service holds, so the service is read
@@ -1400,7 +1555,8 @@ def self_test():
           "the service  <-- pinned defect")
     check("dataSource_1-18f00000002-layer-3-2" not in
           [ref.dsid for _, ref, v in report.findings if v.status != OK],
-          "and a nested service sublayer uses the flat <layer>-<sublayer> id")
+          "and a nested service sublayer resolves by its own id, "
+          "<layer>-<sublayer>")
     docs = dict(services)
     docs[base + "/Utilities/Water/MapServer"] = {"layers": [{"id": 0},
                                                             {"id": 1}]}
@@ -1506,6 +1662,51 @@ def self_test():
           "be read, so this run proves nothing about it.",
           "and its verdict is incomplete, with nothing unread and nothing inert"
           "  <-- pinned defect")
+
+    # ---- a map service layer added from a Map Image Layer item. When the
+    # web map's array does not decide the sublayers, the item's /data can
+    layer_item = "abcdef0123456789abcdef0123456789"
+    water_2 = "dataSource_1-18f00000002-layer-3-2"
+    wm = copy(webmap)
+    wm["operationalLayers"][1]["itemId"] = layer_item
+    decides = {"layers": [{"id": 0, "minScale": 0},
+                          {"id": 1, "layerDefinition": {"minScale": 0}}]}
+    report = run(app, wm, items={layer_item: decides})
+    reason = [v.reason for _, r, v in report.findings if r.dsid == water_2][0]
+    check(statuses(report)[water_2] == DANGLING and exit_code(report) == 1 and
+          "the layers array of its layer item %s sets scale ranges and omits "
+          "it" % layer_item in reason,
+          "a sublayer the layer item's scale-range array omits is DANGLING, "
+          "although the web map has no layers array and the service "
+          "publishes it  <-- pinned defect")
+    check(report.items_read == 1 and describe(report)[1].endswith(
+        ", layer items read: 1 of 1"),
+          "and the run counts the layer item it read")
+    check([exit_code(run(app, wm, items={layer_item: data})) for data in
+           (None, {}, {"layers": [{"id": 0, "popupInfo": {}}]}, [1])]
+          == [0] * 4,
+          "a layer item with no data, or with no scale ranges, leaves the "
+          "service to decide")
+    report = run(app, wm)
+    reason = [v.reason for _, r, v in report.findings if r.dsid == water_2][0]
+    check(statuses(report)[water_2] == UNJUDGED and exit_code(report) == 2 and
+          "its layer item %s could not be read" % layer_item in reason and
+          ("layer item %s" % layer_item, "no layer item") in report.unread,
+          "a layer item that cannot be read leaves the sublayer UNJUDGED and "
+          "the run exits 2, never 0  <-- pinned defect")
+    raises(lambda: item_data({"error": {"code": 403, "message": "denied"}}),
+           "a layer item error body is unread", Unread)
+    report = run(only_map_of(wm_id), wm)
+    check(exit_code(report) == 0 and report.items_total == 0,
+          "a layer item is read only when a reference needs it")
+    wm["operationalLayers"][1]["layers"] = [{"id": 2, "minScale": 0}]
+    report = run(app, wm)
+    check(statuses(report)[water_2] == OK and report.items_total == 0,
+          "the web map's own scale-range array wins, and the item is not read")
+    wm["operationalLayers"][1]["layers"] = []
+    wm["operationalLayers"][1]["itemId"] = "../x"
+    check(index_webmap(wm)[1]["18f00000002-layer-3"]["item"] is None,
+          "an itemId that is not an item id is never read")
 
     # ---- feature layers, tables, groups
     docs = dict(services)
@@ -1834,6 +2035,18 @@ def self_test():
     inert = [r for _, r, _ in got.findings if r.inert]
     check(len(inert) == 3 and all("layersConfig" in r.path for r in inert),
           "references inside a MAP-mode table's layersConfig are marked inert")
+    beside = {"widgets": {"t": {"config": {"tableMode": "MAP",
+                                           "layersConfig": [], "other": {
+                                               "useDataSource": {
+                                                   "dataSourceId":
+                                                   "dataSource_1-L-9"}}}}},
+              "dataSources": {"dataSource_1": {"type": "WEB_MAP",
+                                               "itemId": wm_id}}}
+    report = run(beside, nested_wm, {svc_x: {"layers": [{"id": 0}]}})
+    check(statuses(report) == {"dataSource_1-L-9": DANGLING} and
+          exit_code(report) == 1,
+          "a dangling reference beside layersConfig in a MAP-mode table's "
+          "config is DANGLING, exit 1, not INERT  <-- pinned defect")
 
     # ---- inert and divergence
     broken = copy(app)
@@ -2332,6 +2545,30 @@ def self_test():
           "offline: two unnamed web maps are a usage error naming the fix")
     code, out, err = run_cli([app_file, "--service", "nothing"])
     check(code == 64, "offline: a malformed --service is a usage error")
+    wm_item = copy(webmap)
+    wm_item["operationalLayers"][1]["itemId"] = layer_item
+    wm_item_file = put("webmap_item.json", wm_item)
+    item_file = put("layeritem.json", decides)
+    code, out, err = run_cli([app_file, "--webmap", wm_item_file,
+                              "--layer-item", "%s=%s" % (layer_item,
+                                                         item_file)]
+                             + svc_args)
+    check(code == 1 and "layer item %s sets scale ranges" % layer_item in out,
+          "offline: --layer-item gives a layer item's /data, and a sublayer "
+          "its scale-range array omits exits 1")
+    code, out, err = run_cli([app_file, "--webmap", wm_item_file,
+                              "--layer-item", "%s=%s" % (
+                                  layer_item, put("empty.json", None, raw=""))]
+                             + svc_args)
+    check(code == 0, "offline: an empty --layer-item file, which is what the "
+          "portal returns for an item with no data, leaves the service to "
+          "decide")
+    code, out, err = run_cli([app_file, "--webmap", wm_item_file] + svc_args)
+    check(code == 2 and "no --layer-item file was given" in out,
+          "offline: a layer item no --layer-item file covers is unread, exit 2")
+    code, out, err = run_cli([app_file, "--layer-item", item_file])
+    check(code == 64 and "--layer-item takes ITEMID=FILE" in err,
+          "offline: --layer-item with no item id is a usage error")
     report_file = os.path.join(tmp, "report.json")
     code, out, err = run_cli([broken_file, "--webmap", wm_file,
                               "--out", report_file] + svc_args)
@@ -2349,16 +2586,18 @@ def self_test():
     check(code == 1 and "wrote" in out,
           "and a later run replaces its own earlier report")
     inputs = [broken_file, moved_file, wm_file,
-              svc_args[1].split("=", 1)[1]]
+              svc_args[1].split("=", 1)[1], item_file]
     kept = [read_json_file(path) for path in inputs]
     codes = [run_cli([broken_file, "--resource", moved_file, "--webmap",
-                      "%s=%s" % (wm_id, wm_file), "--out",
+                      "%s=%s" % (wm_id, wm_file), "--layer-item",
+                      "%s=%s" % (layer_item, item_file), "--out",
                       os.path.join(os.path.dirname(path), ".",
                                    os.path.basename(path)), "--apply"]
                      + svc_args)[0] for path in inputs]
-    check(codes == [64] * 4 and
+    check(codes == [64] * 5 and
           [read_json_file(path) for path in inputs] == kept,
-          "--out naming the app, the draft, a web map or a service file, "
+          "--out naming the app, the draft, a web map, a service or a "
+          "layer item file, "
           "however it is spelled, is refused and the input is kept  "
           "<-- pinned defect")
     code, out, err = run_cli([broken_file, "--webmap", wm_file, "--out",
@@ -2397,7 +2636,26 @@ def self_test():
     finally:
         sys.argv = argv_before
 
-    # ---- the command line, online, against a loopback portal
+    # ---- the token gate in online mode, with http_json stubbed. The
+    # loopback portal below cannot test it: loopback may have the token.
+    sent = []
+    real_http = globals()["http_json"]
+    globals()["http_json"] = lambda url, secret, *a, **k: sent.append(
+        (url, secret)) or {"layers": [{"id": 0}]}
+    try:
+        gate = argparse.Namespace(portal="https://gis.example.com/portal",
+                                  item=app_id, trust_host=["other.example.com"])
+        get = _online(gate, "TOKEN123")[2]
+        for url in ("http://gis.example.com/s/X/MapServer",
+                    "http://other.example.com/s/X/MapServer",
+                    "https://gis.example.com/s/X/MapServer"):
+            get(url)
+    finally:
+        globals()["http_json"] = real_http
+    check([secret for _, secret in sent] == [None, None, "TOKEN123"],
+          "online: a plain http url on the portal host or a trusted host is "
+          "read without the token, and an https one with it  "
+          "<-- pinned defect")
     token = "tok-SECRET-4f9a+/="
     routes = {}
     seen = []
@@ -2538,6 +2796,21 @@ def self_test():
         code, out, err = run_cli(online)
         check(code == 2 and "not JSON" in out,
               "online: a sign-in page where JSON should be is unread")
+        reset()
+        with_item = copy(o_wm)
+        with_item["operationalLayers"][1]["itemId"] = layer_item
+        routes[rest + wm_id + "/data"] = (200, with_item)
+        routes[rest + layer_item + "/data"] = (200, decides)
+        code, out, err = run_cli(trusting + ["--token", token])
+        check(code == 1 and "layer items read: 1 of 1" in out and [
+            s for s in seen if s[1] == rest + layer_item + "/data" and
+            s[2].get("token") == token],
+              "online: a layer item's /data is read from the portal with the "
+              "token, and a sublayer it omits exits 1")
+        routes[rest + layer_item + "/data"] = (200, "")
+        code, out, err = run_cli(trusting)
+        check(code == 0, "online: an empty body, which is what the portal "
+              "returns for an item with no data, leaves the service to decide")
         reset()
         bad_app = copy(o_app)
         bad_app["dataSources"]["dataSource_1"]["itemId"] = "../../etc"
