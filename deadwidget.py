@@ -1,13 +1,15 @@
 #!/usr/bin/env python
-"""Find the Experience Builder widgets bound to a layer that no longer exists.
+"""Find the Experience Builder widgets bound to a layer that no longer exists,
+or to a layer id that now names another layer, and the Dashboards widgets
+bound to data they cannot read.
 
 An Experience Builder widget names its layer by a data source id such as
 dataSource_1-18f2a3b4c5d-layer-7-3: the app's web map data source, the web map
 layer id, and the sublayer id. A web map edit or a service republish that
 removes that sublayer id leaves the id in the widget config. The builder shows
 no error, the app loads, and the widget does nothing when a user clicks it in
-production. A renumber that gives the old id to another layer still resolves:
-this tool checks that an id exists, not which layer it names.
+production. A renumber that gives the old id to another layer still resolves,
+so an id that exists is compared with a name recorded for it, when one is.
 
 This tool reads the app configuration, collects the value of every key that
 holds a data source id, and checks each one against the data sources the app
@@ -22,12 +24,28 @@ becomes the item /data the next time an author clicks Publish.
     python deadwidget.py app.json --resource config.json --webmap ITEMID=webmap.json
     python deadwidget.py --portal https://org.maps.arcgis.com --item APPITEMID
     python deadwidget.py app.json --webmap webmap.json --out report.json --apply
+    python deadwidget.py app.json --webmap webmap.json --service URL=after.json
+        --before URL=before.json
+    python deadwidget.py dash.json --dashboard --dash-layer ITEMID/0=layer.json
+    python deadwidget.py --dashboard --portal https://org.maps.arcgis.com
+        --item DASHBOARDITEMID
+
+A recorded name shows a renumber: the web map's name for a sublayer, or the
+service description saved before a republish (--before). A binding whose
+name moved to another id is RENUMBERED and fails the run. A name that moved
+nowhere is DRIFTED, which is reported and does not fail the run.
+
+With --dashboard the input is an ArcGIS Dashboards item's /data. Twelve
+rules check each dataset against the fields its layer publishes, each chart
+and table against what its query returns, and each filter action against
+its target. BROKEN fails the run, WARN does not.
 
 Read-only. Nothing is written without --apply, and --apply writes only the
 report file.
 
 Exit codes: 0 every reference resolves in every copy audited, 1 a dangling
-reference in either copy, 2 an input could not be read, a reference could not
+or renumbered reference in either copy, or a BROKEN dashboard finding, 2 an
+input could not be read, a reference could not
 be judged or is of a kind this tool does not audit, or the tool could not
 complete, so the run proves nothing, 64 usage error. A divergence between the two copies is reported but
 does not change the exit code.
@@ -132,9 +150,14 @@ DANGLING = "DANGLING"
 UNJUDGED = "UNJUDGED"
 INERT = "INERT"
 NOT_AUDITED = "NOT AUDITED"
+# The id exists, but a recorded name shows that it now names another layer.
+RENUMBERED = "RENUMBERED"
+# The id exists, and its name changed. Nothing shows where the old name went.
+DRIFTED = "DRIFTED"
 
 # Print order, worst first.
-RANK = {DANGLING: 0, UNJUDGED: 1, NOT_AUDITED: 2, INERT: 3, OK: 4}
+RANK = {DANGLING: 0, RENUMBERED: 1, UNJUDGED: 2, NOT_AUDITED: 3, DRIFTED: 4,
+        INERT: 5, OK: 6}
 
 # The only url schemes fetched. urllib also opens file: and ftp: urls, and a
 # file: url with a host is an SMB connection on Windows. Service urls come
@@ -171,6 +194,15 @@ class Verdict(object):
         self.status = status
         self.reason = reason
         self.need = need
+
+
+class Published(frozenset):
+    """The layer ids a service publishes. names maps a layer's own id to its
+    name. before is the same map from the service as it was before a
+    republish (--before), or None."""
+
+    names = {}
+    before = None
 
 
 # ---------------------------------------------------------- decision core
@@ -233,11 +265,14 @@ def service_ids(doc):
         raise Unread("not a map or feature service description")
     ids = set()
     parent = {}
+    names = {}
     for key in ("layers", "tables"):
         entries = doc.get(key)
         for entry in entries if isinstance(entries, list) else []:
             if isinstance(entry, dict) and entry.get("id") is not None:
                 ids.add("%s" % (entry["id"],))
+                if isinstance(entry.get("name"), str):
+                    names["%s" % (entry["id"],)] = entry["name"]
                 if entry.get("parentLayerId") is not None:
                     parent["%s" % (entry["id"],)] = "%s" % (
                         entry["parentLayerId"],)
@@ -256,7 +291,9 @@ def service_ids(doc):
         # be reported dangling when the truth is that nobody could look.
         raise Unread("the service lists no layers and no tables, which is "
                      "what a secured service returns to an anonymous read")
-    return frozenset(ids)
+    out = Published(ids)
+    out.names = names
+    return out
 
 
 def overhaul(doc):
@@ -279,6 +316,90 @@ def overhaul(doc):
             for s in subs):
         return frozenset("%s" % (s.get("id"),) for s in subs)
     return None
+
+
+def sublayer_names(layer):
+    """{sublayer id: (name, drawn id)} from a map service layer's layers array.
+
+    The web map specification gives each entry a name ("The name of the
+    layer"), apart from its title, and a layerDefinition.source of type
+    mapLayer whose mapLayerId is "the current map layer's id". So name is the
+    service layer the author added, and mapLayerId the one the entry draws.
+    Either can be absent; drawn is then the entry's own id.
+    """
+    out = {}
+    subs = layer.get("layers")
+    for sub in subs if isinstance(subs, list) else []:
+        if not isinstance(sub, dict) or sub.get("id") is None:
+            continue
+        sid = "%s" % (sub["id"],)
+        ldef = sub.get("layerDefinition")
+        source = ldef.get("source") if isinstance(ldef, dict) else None
+        drawn = sid
+        if isinstance(source, dict) and source.get("type") == "mapLayer" \
+                and source.get("mapLayerId") is not None:
+            drawn = "%s" % (source["mapLayerId"],)
+        name = sub.get("name")
+        out[sid] = (name if isinstance(name, str) and name.strip() else None,
+                    drawn)
+    return out
+
+
+def same_name(a, b):
+    return a.strip().lower() == b.strip().lower()
+
+
+def renumbered(got, sid, what, hint=None):
+    """OK, RENUMBERED or DRIFTED for a layer id the service publishes.
+
+    The id alone cannot show a renumber: after a republish that inserts a
+    layer, the old id can still exist and name another layer. A recorded
+    name can. It comes from the web map's sublayer entry (hint) or from the
+    service before the republish (Published.before). A name that is now
+    published under another id is a renumber. A name that is nowhere is
+    drift: a rename or a renumber, and nothing here tells which.
+    """
+    leaf = sid.split("-")[-1]
+    expected, drawn = hint if hint else (None, leaf)
+    source = "the web map"
+    if drawn != leaf:
+        # The entry draws another service layer, so the widget reads that.
+        if drawn not in got:
+            return Verdict(DANGLING, "%s: its web map entry draws service "
+                           "layer %s (layerDefinition.source.mapLayerId), "
+                           "which the service no longer publishes"
+                           % (what, drawn))
+        if expected and leaf in got.names and \
+                same_name(expected, got.names[leaf]) and \
+                drawn in got.names and \
+                not same_name(expected, got.names[drawn]):
+            return Verdict(RENUMBERED, "%s: its web map entry carries the name "
+                           "'%s' of service layer %s but draws layer %s, "
+                           "'%s' (layerDefinition.source.mapLayerId), so the "
+                           "widget reads the wrong layer"
+                           % (what, expected, leaf, drawn, got.names[drawn]))
+    if expected is None and got.before is not None:
+        expected = got.before.get(leaf)
+        source = "the service before the republish (--before)"
+    actual = got.names.get(drawn)
+    if expected is None or actual is None or same_name(expected, actual):
+        return Verdict(OK)
+    moved = sorted((lid for lid in got.names if lid != drawn and
+                    same_name(got.names[lid], expected)), key=_id_order)
+    if moved:
+        return Verdict(RENUMBERED, "%s: %s calls it '%s', and the service now "
+                       "publishes '%s' as layer %s. Layer %s is now '%s', so "
+                       "the widget reads the wrong layer"
+                       % (what, source, expected, expected,
+                          " and ".join(moved), drawn, actual))
+    return Verdict(DRIFTED, "%s: %s calls it '%s' and the service calls it "
+                   "'%s'. A rename or a renumber: no layer the service "
+                   "publishes carries the old name" % (what, source, expected,
+                                                       actual))
+
+
+def _id_order(lid):
+    return (len(lid), lid)
 
 
 def item_data(doc):
@@ -339,7 +460,7 @@ def index_webmap(doc):
             item = item if listed is None and isinstance(item, str) \
                 and ITEM_ID.match(item) else None
             mapsvc[suffix] = {"title": title, "url": root, "listed": listed,
-                              "item": item}
+                              "item": item, "named": sublayer_names(layer)}
         elif index is not None:
             entries[suffix]["check"] = (root, index)
 
@@ -351,16 +472,19 @@ def index_webmap(doc):
     return entries, mapsvc
 
 
-def member(url, sid, services, what):
-    """Is layer sid published by the service at url?"""
+def member(url, sid, services, what, hint=None):
+    """Is layer sid published by the service at url, and is it still the
+    layer it was? hint is (name, drawn id) from the web map, or None."""
     got = services.get(url)
     if got is None:
         return Verdict(UNJUDGED, "service %s has not been read" % url, url)
     if isinstance(got, str):
         return Verdict(UNJUDGED, "service %s could not be read: %s"
                        % (url, got))
-    if sid in got:
-        return Verdict(OK)
+    if not isinstance(got, Published):
+        got = Published(got)
+    if sid in got or (hint and hint[1] != sid.split("-")[-1]):
+        return renumbered(got, sid, what, hint)
     return Verdict(DANGLING, "%s: the service %s no longer publishes layer %s"
                    % (what, url, sid))
 
@@ -417,7 +541,8 @@ def judge_child(child, index, services):
     if not layer["url"]:
         return Verdict(UNJUDGED, "%s: the web map layer has no service url to "
                        "confirm it against" % what)
-    return member(layer["url"], sid, services, what)
+    return member(layer["url"], sid, services, what,
+                  layer["named"].get(chain[-1]))
 
 
 def split_root(dsid, datasources):
@@ -625,6 +750,7 @@ class Report(object):
         self.services_total = 0
         self.items_read = 0
         self.items_total = 0
+        self.unused_before = []   # --before urls no reference needed
 
     def count(self, status):
         return sum(1 for f in self.findings if f[2].status == status)
@@ -634,13 +760,15 @@ class Report(object):
         return bool(self.only_data or self.only_resource)
 
 
-def audit(surfaces, webmap_get, service_get, item_get):
+def audit(surfaces, webmap_get, service_get, item_get, before=None):
     """Audit one app. surfaces is [(name, loader)]; loaders raise Unread.
-    item_get reads a Map Image Layer item's /data.
+    item_get reads a Map Image Layer item's /data. before maps a service url
+    to a loader of that service's description from before a republish.
 
     Services are read only when a reference needs one, so a secured service
     nothing is bound to cannot fail the run.
     """
+    before = before or {}
     report = Report()
     apps = []
     for name, loader in surfaces:
@@ -688,6 +816,14 @@ def audit(surfaces, webmap_get, service_get, item_get):
                 services[url] = "%s" % exc
                 report.unread.append(("layer item %s" % item if item else
                                       "service %s" % url, "%s" % exc))
+                continue
+            if url in before:
+                try:
+                    services[url].before = service_ids(before[url]()).names
+                except Unread as exc:
+                    report.unread.append(("--before for service %s" % url,
+                                          "%s" % exc))
+    report.unused_before = sorted(set(before) - set(services))
     report.items_total = len([u for u in services if isinstance(u, tuple)])
     report.services_total = len(services) - report.items_total
     for name, ref, verdict in verdicts:
@@ -711,7 +847,7 @@ def exit_code(report):
     """
     if report.unread or report.count(UNJUDGED) or report.count(NOT_AUDITED):
         return 2
-    if report.count(DANGLING):
+    if report.count(DANGLING) or report.count(RENUMBERED):
         return 1
     return 0
 
@@ -778,12 +914,19 @@ def describe(report):
                    "are unknown:" % len(report.unread))
         for what, reason in report.unread:
             out.append("  %s: %s" % (what, reason))
+    for url in report.unused_before:
+        out.append("")
+        out.append("NOTE         --before %s was not compared: no reference "
+                   "needs that service, so check the url" % url)
     out.append("")
     out.append("references: %d found, %d ok, %d dangling, %d unjudged, "
                "%d inert, %d not audited"
                % (len(report.findings), report.count(OK),
                   report.count(DANGLING), report.count(UNJUDGED),
                   report.count(INERT), report.count(NOT_AUDITED)))
+    if report.count(RENUMBERED) or report.count(DRIFTED):
+        out[-1] += (", %d renumbered, %d drifted"
+                    % (report.count(RENUMBERED), report.count(DRIFTED)))
     code = exit_code(report)
     if code == 2 and (report.unread or report.count(UNJUDGED)):
         verdict = ("INCOMPLETE. Something could not be read, so this run "
@@ -797,14 +940,22 @@ def describe(report):
         # useDataSources entry carries the same id under two keys.
         bound = len([key for key, _ in grouped(report)
                      if key[3] == DANGLING])
-        verdict = ("%d widget binding(s) point at a layer that does not "
-                   "exist." % bound)
+        moved = len([key for key, _ in grouped(report)
+                     if key[3] == RENUMBERED])
+        verdict = " ".join(text for text in (
+            bound and "%d widget binding(s) point at a layer that does not "
+            "exist." % bound,
+            moved and "%d widget binding(s) point at a layer id that now "
+            "names another layer: see RENUMBERED." % moved) if text)
     elif report.count(INERT):
         verdict = ("every widget binding resolves, but %d reference(s) that "
                    "no widget reads do not: see INERT."
                    % report.count(INERT))
     else:
         verdict = "every data source reference resolves."
+    if code == 0 and report.count(DRIFTED):
+        verdict += (" %d reference(s) resolve to a layer whose name changed: "
+                    "see DRIFTED." % report.count(DRIFTED))
     if report.diverged:
         verdict += (" The builder draft and the published copy bind widgets "
                     "differently: see DIVERGED.")
@@ -833,7 +984,587 @@ def document(report, source):
                        "dangling": report.count(DANGLING),
                        "unjudged": report.count(UNJUDGED),
                        "inert": report.count(INERT),
-                       "notAudited": report.count(NOT_AUDITED)}}
+                       "notAudited": report.count(NOT_AUDITED)},
+            "drift": {"renumbered": report.count(RENUMBERED),
+                      "drifted": report.count(DRIFTED),
+                      "unusedBefore": report.unused_before}}
+
+
+# ------------------------------------------------- dashboards (dashlint)
+#
+# An ArcGIS Dashboards item has one configuration surface, its /data. Each
+# widget reads datasets, and each dataset names a layer by item id and layer
+# id. Esri publishes no schema for this JSON. The keys read here were
+# measured on two public 4.27 exports and match the shapes the author's own
+# dashboards use: datasets[].dataSource {type, itemId, layerId},
+# groupByFields, orderByFields, statisticDefinitions, outFields, filter
+# rules, a serial chart's category, splitBy and graphs, a table's
+# dataSettings.valueFields, and events[].actions[].targets[].
+
+BROKEN = "BROKEN"
+WARN = "WARN"
+DASH_RANK = {BROKEN: 0, UNJUDGED: 1, NOT_AUDITED: 2, WARN: 3}
+
+# Dashboards names the object id field ESRI_OID in a count statistic, on
+# layers whose own object id field has another name. It is not a layer field.
+VIRTUAL_FIELDS = ("esri_oid",)
+
+# Filter rule types Dashboards writes, by the layer field type they match.
+# A field of any other type is not judged.
+FILTER_TYPES = {"esriFieldTypeString": "string",
+                "esriFieldTypeInteger": "integer",
+                "esriFieldTypeSmallInteger": "integer",
+                "esriFieldTypeDouble": "double",
+                "esriFieldTypeSingle": "double",
+                "esriFieldTypeDate": "date"}
+
+
+class Removed(Exception):
+    """A layer that its item or web map no longer publishes."""
+
+
+class Unmodelled(Exception):
+    """A layer of a kind this tool does not audit."""
+
+
+class Layer(object):
+    """A layer's fields, by lower-case name, and its url when known."""
+
+    def __init__(self, fields, ident=None):
+        self.fields = fields
+        self.ident = ident
+
+
+def check_dashboard(doc):
+    """Raise Unread unless doc is an ArcGIS Dashboards item's /data."""
+    problem = payload_error(doc)
+    if problem:
+        raise Unread(problem)
+    if not isinstance(doc, dict) or not (
+            isinstance(doc.get("desktopView"), dict)
+            or isinstance(doc.get("widgets"), list)):
+        raise Unread("not an ArcGIS Dashboards item's data: it has no "
+                     "desktopView object and no widgets array")
+    return doc
+
+
+def layer_fields(doc):
+    """{lower-case name: (name, type)} from a layer description, or Unread."""
+    problem = payload_error(doc)
+    if problem:
+        raise Unread(problem)
+    fields = doc.get("fields") if isinstance(doc, dict) else None
+    out = {}
+    for field in fields if isinstance(fields, list) else []:
+        if isinstance(field, dict) and isinstance(field.get("name"), str):
+            out[field["name"].lower()] = (field["name"], field.get("type"))
+    if not out:
+        raise Unread("not a layer description: it lists no fields")
+    return out
+
+
+def dash_widgets(doc):
+    """[(view, path, widget)] for every widget in a dashboard.
+
+    A widget is an object with a string id and a type that ends in Widget.
+    The mobile view holds its own copies of the widgets, with their own ids,
+    so a target is looked up only in the view of its source.
+    """
+    found = []
+
+    def walk(node, path, view):
+        if isinstance(node, dict):
+            if isinstance(node.get("id"), str) and \
+                    isinstance(node.get("type"), str) and \
+                    node["type"].endswith("Widget"):
+                found.append((view, path, node))
+                return
+            for key in node:
+                walk(node[key], "%s.%s" % (path, key), view)
+        elif isinstance(node, list):
+            for pos, value in enumerate(node):
+                walk(value, "%s[%d]" % (path, pos), view)
+
+    for key in doc:
+        walk(doc[key], key, "mobile" if key == "mobileView" else "desktop")
+    return found
+
+
+def arcade_ids(doc):
+    """The ids of the Arcade data sources a dashboard defines. Newer
+    dashboards keep them in arcadeDataSourceItems, older in dataExpressions."""
+    out = set()
+    for key in ("arcadeDataSourceItems", "dataExpressions"):
+        items = doc.get(key)
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict):
+                out.add(item.get("itemId") or item.get("id"))
+    return out
+
+
+def _bare(name):
+    """An orderByFields entry without its ASC or DESC."""
+    parts = name.split()
+    if len(parts) > 1 and parts[-1].upper() in ("ASC", "DESC"):
+        parts = parts[:-1]
+    return " ".join(parts)
+
+
+def _rules(group):
+    """Every filterRule in a filterGroup, however deeply nested."""
+    rules = group.get("rules") if isinstance(group, dict) else None
+    for rule in rules if isinstance(rules, list) else []:
+        if isinstance(rule, dict) and rule.get("type") == "filterGroup":
+            for inner in _rules(rule):
+                yield inner
+        elif isinstance(rule, dict):
+            yield rule
+
+
+def _names(value):
+    """The strings in a list, or none."""
+    return [v for v in value if isinstance(v, str)] \
+        if isinstance(value, list) else []
+
+
+def query_returns(ds, layer, flag):
+    """Check one dataset's query against its layer. Returns (grouped, the
+    lower-case names its query returns). flag(rule, status, reason) records
+    a finding.
+
+    A query with statistics returns only its group-by fields and its
+    statistics' output names. That is how the REST query operation answers
+    outStatistics with groupByFieldsForStatistics.
+    """
+    fields = layer.fields
+
+    def known(name):
+        return name.lower() in fields or name.lower() in VIRTUAL_FIELDS
+
+    stats = [s for s in ds.get("statisticDefinitions") or []
+             if isinstance(s, dict)]
+    group = _names(ds.get("groupByFields"))
+    aliases = set(s["outStatisticFieldName"].lower() for s in stats
+                  if isinstance(s.get("outStatisticFieldName"), str))
+    for name in group:
+        if not known(name):
+            flag("field-gone", BROKEN, "it groups by '%s', which the layer "
+                 "does not have" % name)
+    for stat in stats:
+        name = stat.get("onStatisticField")
+        if isinstance(name, str) and not known(name):
+            flag("field-gone", BROKEN, "a statistic reads '%s', which the "
+                 "layer does not have" % name)
+    for name in _names(ds.get("outFields")):
+        if name != "*" and not known(name):
+            flag("field-gone", BROKEN, "it asks for field '%s', which the "
+                 "layer does not have" % name)
+    for name in _names(ds.get("orderByFields")):
+        bare = _bare(name)
+        if not known(bare) and bare.lower() not in aliases:
+            flag("field-gone", BROKEN, "it sorts by '%s', which is neither a "
+                 "field of the layer nor a statistic" % bare)
+    for rule in _rules(ds.get("filter")):
+        field = rule.get("field") if isinstance(rule.get("field"), dict) \
+            else {}
+        name = field.get("name")
+        if not isinstance(name, str):
+            continue
+        if not known(name):
+            flag("field-gone", BROKEN, "it filters on '%s', which the layer "
+                 "does not have" % name)
+            continue
+        want = FILTER_TYPES.get(fields[name.lower()][1]) \
+            if name.lower() in fields else None
+        if want and isinstance(field.get("type"), str) and \
+                field["type"] != want:
+            flag("filter-type", BROKEN, "it filters '%s' as %s, and the layer "
+                 "field is %s" % (name, field["type"], want))
+    grouped = bool(group or stats)
+    if grouped:
+        return True, set(n.lower() for n in group) | aliases
+    listed = _names(ds.get("outFields"))
+    if listed and "*" not in listed:
+        return False, set(n.lower() for n in listed)
+    return False, set(fields)
+
+
+def chart_rules(widget, grouped, returns, flag):
+    """series-unbound: a serial chart bound to a field its query does not
+    return. A groupByValues chart reads its category and split from the
+    group-by fields and its values from statistics. A features chart reads
+    raw rows, so its query must not group."""
+    ctype = widget.get("categoryType")
+    category = widget.get("category")
+    split = widget.get("splitBy")
+    graphs = widget.get("graphs")
+    names = []
+    for part in (category, split):
+        if isinstance(part, dict) and isinstance(part.get("fieldName"), str):
+            names.append(("category or split", part["fieldName"]))
+    for graph in graphs if isinstance(graphs, list) else []:
+        if isinstance(graph, dict) and isinstance(graph.get("valueField"), str):
+            names.append(("value", graph["valueField"]))
+    if ctype == "features" and grouped:
+        flag("series-unbound", BROKEN, "a features chart plots rows, but its "
+             "query groups them, so no row field comes back")
+        return
+    if ctype not in ("groupByValues", "features"):
+        return
+    for role, name in names:
+        if name.lower() not in returns:
+            flag("series-unbound", BROKEN, "its %s field '%s' is not "
+                 "returned by its query" % (role, name))
+
+
+def table_rules(widget, grouped, returns, flag):
+    """column-unreturned and stat-unshown for a table."""
+    settings = widget.get("dataSettings")
+    shown = _names(settings.get("valueFields")) \
+        if isinstance(settings, dict) else []
+    for name in shown:
+        if name.lower() not in returns:
+            flag("column-unreturned", BROKEN, "it shows column '%s', which "
+                 "its %s query does not return" % (
+                     name, "grouped" if grouped else "row"))
+    if grouped and shown:
+        missing = sorted(returns - set(n.lower() for n in shown))
+        if missing:
+            flag("stat-unshown", WARN, "its query returns %s, which no column "
+                 "shows" % ", ".join(missing))
+
+
+def lint_dashboard(doc, lookup):
+    """Every finding in one dashboard. lookup(dataSource) returns its Layer,
+    or raises Removed, Unread or Unmodelled. Returns (findings, counts); a
+    finding is (status, rule, view, path, label, reason)."""
+    findings = []
+    arcade = arcade_ids(doc)
+    widgets = dash_widgets(doc)
+    # Per view, per widget id: (widget, label, {dataset name: info}).
+    # info is (source key, Layer or None, grouped, returned names or None).
+    views = {}
+    counts = {"widgets": len(widgets), "datasets": 0, "targets": 0}
+    for view, path, widget in widgets:
+        label = "'%s' (%s), %s view" % (widget.get("name") or widget["id"],
+                                        widget["type"], view)
+        info = {}
+        views.setdefault(view, {})[widget["id"]] = (widget, label, info,
+                                                    path)
+        datasets = widget.get("datasets")
+        for pos, ds in enumerate(datasets if isinstance(datasets, list)
+                                 else []):
+            if not isinstance(ds, dict):
+                continue
+            counts["datasets"] += 1
+            where = "%s.datasets[%d]" % (path, pos)
+
+            def flag(rule, status, reason, where=where):
+                findings.append((status, rule, view, where, label, reason))
+            src = ds.get("dataSource") if isinstance(ds.get("dataSource"),
+                                                     dict) else {}
+            key = (src.get("type"), src.get("itemId"),
+                   "%s" % (src.get("layerId"),))
+            if src.get("type") == "arcadeDataSource":
+                if src.get("itemId") not in arcade:
+                    flag("arcade-gone", BROKEN, "it reads Arcade data source "
+                         "%s, which this dashboard does not define"
+                         % src.get("itemId"))
+                info[ds.get("name")] = (key, None, False, None)
+                continue
+            if src.get("type") != "layerDataSource":
+                flag("", NOT_AUDITED, "a %s data source is not audited"
+                     % (src.get("type") or "untyped"))
+                continue
+            try:
+                layer = lookup(src)
+            except Removed as exc:
+                flag("layer-gone", BROKEN, "%s" % exc)
+                continue
+            except Unread as exc:
+                flag("", UNJUDGED, "its layer could not be read: %s" % exc)
+                continue
+            except Unmodelled as exc:
+                flag("", NOT_AUDITED, "%s" % exc)
+                continue
+            grouped, returns = query_returns(ds, layer, flag)
+            info[ds.get("name")] = (key, layer, grouped, returns)
+            if pos == 0 and widget["type"] == "serialChartWidget":
+                chart_rules(widget, grouped, returns, flag)
+            if pos == 0 and widget["type"] == "tableWidget":
+                table_rules(widget, grouped, returns, flag)
+    for view in sorted(views):
+        required = {}
+        for wid in views[view]:
+            widget, label, info, path = views[view][wid]
+            source = (widget.get("datasets") or [None])[0]
+            source = info.get(source.get("name")) \
+                if isinstance(source, dict) else None
+            for e, a, t, target in _targets(widget):
+                counts["targets"] += 1
+                where = "%s.events[%d].actions[%d].targets[%d]" % (
+                    path, e, a, t)
+
+                def flag(rule, status, reason, where=where):
+                    findings.append((status, rule, view, where, label,
+                                     reason))
+                dest = _target_info(target, views[view], lookup, flag)
+                if dest is None:
+                    continue
+                if target.get("requiresSelection") is True:
+                    required.setdefault(dest[0], []).append(widget)
+                _field_map(target, source, dest[1], flag)
+        for wid in sorted(required):
+            sources = required[wid]
+            if len(sources) > 1 and any(s["type"] != "categorySelectorWidget"
+                                        for s in sources):
+                _, label, _, path = views[view][wid]
+                findings.append((WARN, "selection-and", view, path, label,
+                                 "it renders only when every source that it "
+                                 "requires a selection from has one, and %d "
+                                 "sources require it, not all of them "
+                                 "selectors" % len(sources)))
+    findings.sort(key=lambda f: (DASH_RANK[f[0]], f[3], f[1], f[5]))
+    return findings, counts
+
+
+def _targets(widget):
+    """(event, action, target positions, target) for every action target."""
+    events = widget.get("events")
+    for e, event in enumerate(events if isinstance(events, list) else []):
+        actions = event.get("actions") if isinstance(event, dict) else None
+        for a, action in enumerate(actions if isinstance(actions, list)
+                                   else []):
+            targets = action.get("targets") if isinstance(action, dict) \
+                else None
+            for t, target in enumerate(targets if isinstance(targets, list)
+                                       else []):
+                if isinstance(target, dict):
+                    yield e, a, t, target
+
+
+def _target_info(target, view, lookup, flag):
+    """(target widget id, dataset info or None) for one action target, or
+    None when the target does not resolve.
+
+    A target id is <widget id>#<dataset name>. A map widget has no datasets:
+    after the # it names a layer of its web map.
+    """
+    tid = target.get("targetId")
+    wid, _, name = tid.partition("#") if isinstance(tid, str) else ("", "",
+                                                                    "")
+    if wid not in view:
+        flag("target-gone", BROKEN, "it filters widget %s, which this view "
+             "does not have, so the action reaches nothing" % (wid or tid))
+        return None
+    widget, label, info, _ = view[wid]
+    if widget["type"] == "mapWidget":
+        try:
+            layer = lookup({"itemId": widget.get("itemId"), "layerId": name})
+        except Removed as exc:
+            flag("target-gone", BROKEN, "it filters layer %s of map %s: %s"
+                 % (name, label, exc))
+            return None
+        except (Unread, Unmodelled) as exc:
+            flag("", UNJUDGED, "its target layer %s of map %s could not be "
+                 "judged: %s" % (name, label, exc))
+            return None
+        return wid, (("layerDataSource", widget.get("itemId"), name), layer,
+                     False, set(layer.fields))
+    if name not in info:
+        if name not in [d.get("name") for d in widget.get("datasets") or []
+                        if isinstance(d, dict)]:
+            flag("target-dataset-gone", BROKEN, "it filters dataset '%s' of %s,"
+                 " which has no dataset of that name" % (name, label))
+            return None
+        # The dataset is there, but its layer was not judged; that finding
+        # is already reported on the target.
+        return wid, None
+    return wid, info[name]
+
+
+def _field_map(target, source, dest, flag):
+    """cross-no-fieldmap, fieldmap-many and field-gone for one target."""
+    if target.get("by") != "whereClause" or source is None or dest is None:
+        return
+    pairs = target.get("fieldMap")
+    pairs = [p for p in pairs if isinstance(p, dict)] \
+        if isinstance(pairs, list) else []
+    same = source[0] == dest[0] or (
+        source[1] is not None and dest[1] is not None and
+        source[1].ident is not None and source[1].ident == dest[1].ident)
+    if not pairs and not same:
+        flag("cross-no-fieldmap", BROKEN, "it filters a widget that reads "
+             "another data source and maps no fields, so the filter matches "
+             "nothing. Esri: the relationship between the sources must be "
+             "established")
+    if len(pairs) > 1:
+        flag("fieldmap-many", WARN, "it maps %d fields, and the author's "
+             "dashboards applied only the first" % len(pairs))
+    for pair in pairs:
+        for side, info, verb in (("sourceName", source, "emits"),
+                                 ("targetName", dest, "filters")):
+            name = pair.get(side)
+            if not isinstance(name, str) or info[3] is None:
+                continue
+            fields = info[3] if side == "sourceName" else (
+                set(info[1].fields) if info[1] else info[3])
+            if name.lower() not in fields:
+                flag("field-gone", BROKEN, "its field map %s '%s', which that "
+                     "side's query does not return" % (verb, name))
+
+
+def dash_exit(findings, unread):
+    """2 when something could not be judged, 1 when a binding is broken."""
+    statuses = set(f[0] for f in findings)
+    if unread or UNJUDGED in statuses or NOT_AUDITED in statuses:
+        return 2
+    return 1 if BROKEN in statuses else 0
+
+
+def dash_describe(findings, counts, unread, reads):
+    """The lines the command line prints for a dashboard."""
+    out = ["deadwidget: dashboard, %d widget(s), %d dataset(s), %d action "
+           "target(s)" % (counts["widgets"], counts["datasets"],
+                          counts["targets"]),
+           "web maps read: %d of %d, layers read: %d of %d" % reads]
+    for status, rule, view, where, label, reason in findings:
+        out.append("")
+        out.append("%-12s %s" % (status, rule or "-"))
+        out.append("             %s" % label)
+        out.append("             %s" % reason)
+        out.append("             at %s" % where)
+    if unread:
+        out.append("")
+        out.append("%d input(s) COULD NOT BE READ, so they are not clean, they "
+                   "are unknown:" % len(unread))
+        for what, reason in unread:
+            out.append("  %s: %s" % (what, reason))
+    tally = dict((s, len([f for f in findings if f[0] == s]))
+                 for s in DASH_RANK)
+    out.append("")
+    out.append("findings: %d broken, %d unjudged, %d not audited, %d warn"
+               % (tally[BROKEN], tally[UNJUDGED], tally[NOT_AUDITED],
+                  tally[WARN]))
+    code = dash_exit(findings, unread)
+    if code == 2 and (unread or tally[UNJUDGED]):
+        verdict = ("INCOMPLETE. Something could not be read, so this run "
+                   "proves nothing about it.")
+    elif code == 2:
+        verdict = ("INCOMPLETE. %d dataset(s) are of a kind this tool does "
+                   "not audit, so this run proves nothing about them."
+                   % tally[NOT_AUDITED])
+    elif code == 1:
+        verdict = ("%d finding(s) bind a widget to data it cannot read."
+                   % tally[BROKEN])
+    else:
+        verdict = "every widget reads data its layer returns."
+        if tally[WARN]:
+            verdict += " See the %d WARN finding(s)." % tally[WARN]
+    out.append("VERDICT: " + verdict)
+    return out
+
+
+def dash_document(findings, counts, unread, source):
+    """The report file for a dashboard."""
+    return {"deadwidget": 1, "mode": "dashboard", "source": source,
+            "exit": dash_exit(findings, unread),
+            "unread": [{"input": w, "reason": r} for w, r in unread],
+            "findings": [{"status": s, "rule": r, "view": v, "path": p,
+                          "widget": w, "reason": why}
+                         for s, r, v, p, w, why in findings],
+            "counts": dict(counts, **dict(
+                (key, len([f for f in findings if f[0] == status]))
+                for key, status in (("broken", BROKEN), ("unjudged", UNJUDGED),
+                                    ("notAudited", NOT_AUDITED),
+                                    ("warn", WARN))))}
+
+
+def dash_webmaps(doc):
+    """The web map item ids a dashboard reads layers from: a map widget's
+    item, and the item of a dataset whose layer id is a web map layer id."""
+    out = set()
+    for _, _, widget in dash_widgets(doc):
+        if widget["type"] == "mapWidget" and \
+                isinstance(widget.get("itemId"), str):
+            out.add(widget["itemId"])
+        datasets = widget.get("datasets")
+        for ds in datasets if isinstance(datasets, list) else []:
+            src = ds.get("dataSource") if isinstance(ds, dict) else None
+            if isinstance(src, dict) and isinstance(src.get("itemId"), str) \
+                    and isinstance(src.get("layerId"), str) \
+                    and not src["layerId"].isdigit():
+                out.add(src["itemId"])
+    return out
+
+
+def dash_audit(load, webmap_get, layer_get):
+    """Lint one dashboard. load() returns its /data. webmap_get(item) returns
+    a web map's /data. layer_get(item, layer id, web map entry or None)
+    returns a Layer, or raises Removed or Unread.
+
+    A layer id that is a number names a layer of a layer item. Any other
+    layer id names a web map layer, and the item is the web map.
+    Returns (findings, counts, unread, reads).
+    """
+    unread = []
+    try:
+        doc = check_dashboard(load())
+    except Unread as exc:
+        return ([], {"widgets": 0, "datasets": 0, "targets": 0},
+                [("dashboard", "%s" % exc)], (0, 0, 0, 0))
+    webmaps = {}
+    layers = {}
+
+    def resolve(item, lid):
+        entry = None
+        if not lid.isdigit():
+            if item not in webmaps:
+                try:
+                    webmaps[item] = index_webmap(webmap_get(item))
+                except Unread as exc:
+                    webmaps[item] = "%s" % exc
+                    unread.append(("web map %s" % item, "%s" % exc))
+            if isinstance(webmaps[item], str):
+                raise Unread("web map %s could not be read" % item)
+            entries, mapsvc = webmaps[item]
+            # A layer in a group is <group>-<layer> in the index, and the
+            # dashboard names it by its own id.
+            hits = sorted(k for k in entries if k == lid or
+                          k.endswith("-" + lid))
+            if not hits:
+                if [k for k in entries if lid.startswith(k + "-")]:
+                    raise Unmodelled("layer %s is a sublayer of a layer in web "
+                                     "map %s, which is not audited"
+                                     % (lid, item))
+                raise Removed("web map %s has no layer %s" % (item, lid))
+            entry = entries[hits[0]]
+            if entry["opaque"] or hits[0] in mapsvc:
+                raise Unmodelled("layer %s of web map %s is a %s, which is "
+                                 "not audited" % (lid, item, entry["opaque"]
+                                                  or "map image layer"))
+        return layer_get(item, lid, entry)
+
+    def lookup(src):
+        item, lid = src.get("itemId"), src.get("layerId")
+        if not isinstance(item, str) or not item or lid is None:
+            raise Unread("the data source names no item id or no layer id")
+        key = (item, "%s" % (lid,))
+        if key not in layers:
+            try:
+                layers[key] = resolve(*key)
+            except (Removed, Unread, Unmodelled) as exc:
+                layers[key] = exc
+        if isinstance(layers[key], Exception):
+            raise layers[key]
+        return layers[key]
+
+    findings, counts = lint_dashboard(doc, lookup)
+    reads = (len([w for w in webmaps.values() if not isinstance(w, str)]),
+             len(webmaps),
+             len([v for v in layers.values() if isinstance(v, Layer)]),
+             len(layers))
+    return findings, counts, unread, reads
 
 
 # ------------------------------------------------------------------ inputs
@@ -998,16 +1729,34 @@ def bind_webmaps(specs, items):
     return keyed
 
 
-def parse_services(specs):
+def parse_services(specs, flag="--service"):
     """--service URL=FILE pairs, keyed by the normalized service url."""
     out = {}
     for spec in specs:
         url, sep, path = spec.partition("=")
         root = service_root(url)[0]
         if not sep or not path or not root:
-            raise ValueError("--service takes URL=FILE, where URL is a "
-                             "MapServer or FeatureServer url: %s" % spec)
+            raise ValueError("%s takes URL=FILE, where URL is a "
+                             "MapServer or FeatureServer url: %s"
+                             % (flag, spec))
         out[root] = path
+    return out
+
+
+def parse_keyed(specs, flag, layer):
+    """--dash-service ITEMID=FILE or, with layer, --dash-layer
+    ITEMID/LAYERID=FILE pairs, keyed by ITEMID or ITEMID/LAYERID."""
+    out = {}
+    for spec in specs:
+        key, _, path = spec.partition("=")
+        item, slash, lid = key.partition("/")
+        if not path or not ITEM_ID.match(item) or bool(slash) != layer \
+                or (layer and not lid):
+            raise ValueError("%s takes %s=FILE, where ITEMID is 32 "
+                             "hexadecimal characters: %s"
+                             % (flag, "ITEMID/LAYERID" if layer else "ITEMID",
+                                spec))
+        out[key] = path
     return out
 
 
@@ -1026,7 +1775,8 @@ def _parse(argv):
     ap = _Parser(
         prog="deadwidget.py",
         description="Find the Experience Builder widgets bound to a layer "
-                    "that no longer exists.",
+                    "that no longer exists or was renumbered, and the "
+                    "Dashboards widgets bound to data they cannot read.",
         epilog="Read-only. Nothing is written without --apply.",
         allow_abbrev=False)
     ap.add_argument("app", nargs="?", metavar="APP_JSON",
@@ -1046,6 +1796,24 @@ def _parse(argv):
                     default=[], metavar="ITEMID=FILE",
                     help="a Map Image Layer item's /data saved as JSON, for a "
                          "web map layer added from that item. Repeatable.")
+    ap.add_argument("--before", action="append", default=[],
+                    metavar="URL=FILE",
+                    help="a service's ?f=json description saved before a "
+                         "republish. A layer whose name moved to another id "
+                         "is RENUMBERED. Repeatable.")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="the input is an ArcGIS Dashboards item's /data, not "
+                         "an Experience Builder app")
+    ap.add_argument("--dash-layer", dest="dash_layer", action="append",
+                    default=[], metavar="ITEMID/LAYERID=FILE",
+                    help="with --dashboard, offline: a layer's ?f=json "
+                         "description, for the layer a dataset names. "
+                         "Repeatable.")
+    ap.add_argument("--dash-service", dest="dash_service", action="append",
+                    default=[], metavar="ITEMID=FILE",
+                    help="with --dashboard, offline: the ?f=json description "
+                         "of a layer item's service, to tell a removed layer "
+                         "from an unread one. Repeatable.")
     ap.add_argument("--portal", metavar="URL",
                     help="portal url (online mode), for example "
                          "https://org.maps.arcgis.com")
@@ -1138,8 +1906,9 @@ def _offline(args):
     return surfaces, webmap_get, service_get, item_get, args.app
 
 
-def _online(args, token):
-    """Loaders that read the portal and the services over REST."""
+def _fetcher(args, token):
+    """get(url) for online mode: only accepted hosts, the token only where it
+    may go. Returns (get, sharing/rest url, referer)."""
     rest = rest_root(args.portal)
     referer = args.portal.rstrip("/")
     trusted = set(host.lower() for host in args.trust_host)
@@ -1153,7 +1922,12 @@ def _online(args, token):
                          "--trust-host, so it was not fetched")
         secret = token if token and token_ok(url) else None
         return http_json(url, secret, referer, bust, redirect_ok=token_ok)
+    return get, rest, referer
 
+
+def _online(args, token):
+    """Loaders that read the portal and the services over REST."""
+    get, rest, referer = _fetcher(args, token)
     item_url = "%s/content/items/%s" % (rest, args.item)
     surfaces = [(DATA, lambda: get(item_url + "/data")),
                 (RESOURCE, lambda: get(item_url +
@@ -1170,6 +1944,84 @@ def _online(args, token):
             "%s item %s" % (referer, args.item))
 
 
+def _online_dash(args, token):
+    """Dashboard loaders over REST. A layer item's url comes from the item,
+    a web map layer's from the web map. The service is read first, so a
+    layer it no longer publishes is told apart from one that is unread."""
+    get, rest, referer = _fetcher(args, token)
+    roots = {}
+
+    def webmap_get(item):
+        if not ITEM_ID.match(item):
+            raise Unread("not an item id, so it was not fetched")
+        return get("%s/content/items/%s/data" % (rest, item))
+
+    def layer_get(item, lid, entry):
+        if entry is not None:
+            if not entry["check"]:
+                raise Unread("the web map layer names no feature layer url")
+            root, index = entry["check"]
+        else:
+            if not ITEM_ID.match(item):
+                raise Unread("not an item id, so it was not fetched")
+            info = get("%s/content/items/%s" % (rest, item))
+            problem = payload_error(info)
+            if problem:
+                raise Unread(problem)
+            root = service_root(info.get("url") if isinstance(info, dict)
+                                else None)[0]
+            if not root:
+                raise Unread("item %s names no map or feature service url"
+                             % item)
+            index = lid
+        if root not in roots:
+            try:
+                roots[root] = service_ids(get(root))
+            except Unread as exc:
+                roots[root] = "%s" % exc
+        if isinstance(roots[root], str):
+            raise Unread("service %s could not be read: %s"
+                         % (root, roots[root]))
+        if index not in roots[root]:
+            raise Removed("the service %s no longer publishes layer %s"
+                       % (root, index))
+        url = "%s/%s" % (root, index)
+        return Layer(layer_fields(get(url)), url)
+
+    return ((lambda: get("%s/content/items/%s/data" % (rest, args.item))),
+            webmap_get, layer_get, "%s item %s" % (referer, args.item))
+
+
+def _offline_dash(args):
+    """Dashboard loaders for saved JSON files, or ValueError."""
+    layers = parse_keyed(args.dash_layer, "--dash-layer", True)
+    services = parse_keyed(args.dash_service, "--dash-service", False)
+    try:
+        items = dash_webmaps(check_dashboard(read_json_file(args.app)))
+    except Unread:
+        items = None        # dash_audit reports it
+    files = bind_webmaps(args.webmap, items) if items is not None else {}
+
+    def webmap_get(item):
+        if item not in files:
+            raise Unread("no --webmap file was given for this item")
+        return read_json_file(files[item])
+
+    def layer_get(item, lid, entry):
+        if entry is None and item in services:
+            if lid not in service_ids(read_json_file(services[item])):
+                raise Removed("the --dash-service file for item %s does not "
+                           "publish layer %s" % (item, lid))
+        key = "%s/%s" % (item, lid)
+        if key not in layers:
+            raise Unread("no --dash-layer file was given for %s" % key)
+        ident = "%s/%s" % entry["check"] if entry and entry["check"] else None
+        return Layer(layer_fields(read_json_file(layers[key])), ident)
+
+    return ((lambda: read_json_file(args.app)), webmap_get, layer_get,
+            args.app)
+
+
 def main(argv=None, environ=None):
     args = _parse(sys.argv[1:] if argv is None else argv)
     environ = os.environ if environ is None else environ
@@ -1183,11 +2035,19 @@ def main(argv=None, environ=None):
                       "--self-test to verify the tool without them.")
     if args.apply and not args.out:
         return _usage("--apply needs --out")
+    if args.dashboard and (args.resource or args.service or args.layer_item
+                           or args.before):
+        return _usage("--resource, --service, --layer-item and --before are "
+                      "Experience Builder inputs. A dashboard takes --webmap, "
+                      "--dash-layer and --dash-service")
+    if not args.dashboard and (args.dash_layer or args.dash_service):
+        return _usage("--dash-layer and --dash-service need --dashboard")
     if args.out and os.path.exists(args.out):
         # The saved app JSON is often the only copy from before an edit.
         # A spec such as ITEMID=FILE is tried whole and after its "=".
         for spec in ([args.app, args.resource] + args.webmap + args.service
-                     + args.layer_item):
+                     + args.layer_item + args.before + args.dash_layer
+                     + args.dash_service):
             for path in [spec] + (spec or "").split("=", 1)[1:]:
                 if (path and os.path.exists(path)
                         and os.path.samefile(path, args.out)):
@@ -1210,14 +2070,23 @@ def main(argv=None, environ=None):
                 and not is_loopback(host):
             return _usage("refusing to send a token to a plain http portal")
     try:
-        if online:
-            loaders = _online(args, token)
-        else:
-            try:
-                loaders = _offline(args)
-            except ValueError as exc:
-                return _usage(exc)
-        return _run(args, token, *loaders)
+        if args.dashboard:
+            if online:
+                loaders = _online_dash(args, token)
+            else:
+                try:
+                    loaders = _offline_dash(args)
+                except ValueError as exc:
+                    return _usage(exc)
+            return _dash_run(args, token, *loaders)
+        try:
+            before = dict((url, (lambda path=path: read_json_file(path)))
+                          for url, path in parse_services(
+                              args.before, "--before").items())
+            loaders = _online(args, token) if online else _offline(args)
+        except ValueError as exc:
+            return _usage(exc)
+        return _run(args, token, *loaders, before=before)
     except Exception as exc:
         # Deliberately broad. Exit 1 means "dangling references found", so a
         # crash on input nobody foresaw must never leave with it.
@@ -1248,20 +2117,34 @@ def flushed(code, stream):
     return code
 
 
-def _run(args, token, surfaces, webmap_get, service_get, item_get, source):
+def _run(args, token, surfaces, webmap_get, service_get, item_get, source,
+         before=None):
     """Audit, print, and write the report file behind --apply."""
-    report = audit(surfaces, webmap_get, service_get, item_get)
-    for line in describe(report):
+    report = audit(surfaces, webmap_get, service_get, item_get, before)
+    return _emit(args, token, describe(report),
+                 lambda: document(report, source), exit_code(report))
+
+
+def _dash_run(args, token, load, webmap_get, layer_get, source):
+    """Lint a dashboard, print, and write the report file behind --apply."""
+    findings, counts, unread, reads = dash_audit(load, webmap_get, layer_get)
+    return _emit(args, token, dash_describe(findings, counts, unread, reads),
+                 lambda: dash_document(findings, counts, unread, source),
+                 dash_exit(findings, unread))
+
+
+def _emit(args, token, lines, report_doc, code):
+    """Print the lines, and write report_doc() to --out only with --apply."""
+    for line in lines:
         say(redact(line, token))
-    code = exit_code(report)
     if args.out:
         if not args.apply:
             say("")
             say("Check only. %s was not written. Re-run with --apply."
                 % args.out)
             return code
-        text = redact(json.dumps(document(report, source), indent=2,
-                                 sort_keys=True), token)
+        text = redact(json.dumps(report_doc(), indent=2, sort_keys=True),
+                      token)
         try:
             with io.open(args.out, "w", encoding="ascii") as handle:
                 handle.write(text + "\n")
@@ -1403,7 +2286,7 @@ def self_test():
     app, webmap, services = fixture(base)
 
     def run(app_doc, webmap_doc=None, service_docs=None, resource=None,
-            items=None):
+            items=None, before=None):
         docs = services if service_docs is None else service_docs
         surfaces = [(DATA, lambda: app_doc)]
         if resource is not None:
@@ -1423,7 +2306,7 @@ def self_test():
             if item not in (items or {}):
                 raise Unread("no layer item")
             return items[item]
-        return audit(surfaces, wm_get, svc_get, item_get)
+        return audit(surfaces, wm_get, svc_get, item_get, before)
 
     def only_map_of(item):
         return {"widgets": {"widget_1": {"useDataSources": [
@@ -1452,8 +2335,8 @@ def self_test():
         {"id": n, "name": "Parcels" if n == 15 else "Zoning %d" % n}
         for n in range(16)]}
     check(exit_code(run(app, webmap, shifted)) == 0,
-          "a republish that gives id 15 to another layer still reads ok: "
-          "the tool checks that an id exists, not what it names (Limits)")
+          "with no name recorded anywhere, a republish that gives id 15 to "
+          "another layer still reads ok: nothing says what it named (Limits)")
 
     # ---- trap (b): whole ids at dash boundaries, never substrings
     wm = copy(webmap)
@@ -2287,6 +3170,152 @@ def self_test():
            "renumbered, its new tab lost the settings" in x],
           "and it says a renumbered layer lost the entry's settings")
 
+    # ---- name drift and renumbers. An id alone cannot show a renumber; a
+    # name the web map or the old service recorded can.
+    zoning = base + "/Planning/Zoning/MapServer"
+    named = copy(webmap)
+    named["operationalLayers"][0]["layers"] = [
+        {"id": n, "minScale": 0, "name": "Zoning %d" % n} for n in range(16)]
+    same = copy(services)
+    same[zoning] = {"layers": [{"id": n, "name": " zoning %d " % n}
+                               for n in range(16)]}
+    report = run(app, named, same)
+    check(exit_code(report) == 0 and report.count(RENUMBERED) == 0 and
+          report.count(DRIFTED) == 0,
+          "web map sublayer names that match the service, ignoring case and "
+          "spaces, read ok")
+    check(service_ids(same[zoning]) == frozenset("%d" % n for n in range(16))
+          and service_ids(same[zoning]).names["15"] == " zoning 15 ",
+          "a service still compares equal to its id set, and carries names")
+    # A republish inserted Parcels at id 1, so every later id moved up one.
+    inserted = copy(services)
+    inserted[zoning] = {"layers": [{"id": 0, "name": "Zoning 0"},
+                                   {"id": 1, "name": "Parcels"}] +
+                        [{"id": n, "name": "Zoning %d" % (n - 1)}
+                         for n in range(2, 17)]}
+    report = run(app, named, inserted)
+    got = statuses(report)
+    reason = [v.reason for _, r, v in report.findings
+              if r.dsid.endswith("layer-25-15")][0]
+    check(got["dataSource_1-18f00000001-layer-25-15"] == RENUMBERED and
+          got["dataSource_1-18f00000001-layer-25-1"] == RENUMBERED and
+          exit_code(report) == 1,
+          "a republish that shifts the ids is RENUMBERED and exits 1, though "
+          "every id still exists  <-- pinned defect")
+    check("the web map calls it 'Zoning 15', and the service now publishes "
+          "'Zoning 15' as layer 16. Layer 15 is now 'Zoning 14'" in reason,
+          "and it names where the layer went and what the id names now")
+    lines = describe(report)
+    check(lines[-1] == "VERDICT: 3 widget binding(s) point at a layer id "
+          "that now names another layer: see RENUMBERED." and
+          [x for x in lines if x.startswith("RENUMBERED   dataSource_1-")] and
+          "references: 33 found, 27 ok, 0 dangling, 0 unjudged, 0 inert, "
+          "0 not audited, 6 renumbered, 0 drifted" in lines,
+          "the verdict counts renumbered bindings, and the counts line adds "
+          "them only when there are any")
+    renamed = copy(same)
+    renamed[zoning]["layers"][15]["name"] = "Zoning districts"
+    report = run(app, named, renamed)
+    lines = describe(report)
+    check(statuses(report)["dataSource_1-18f00000001-layer-25-15"] == DRIFTED
+          and exit_code(report) == 0 and lines[-1] == "VERDICT: every data "
+          "source reference resolves. 4 reference(s) resolve to a layer "
+          "whose name changed: see DRIFTED.",
+          "a name that is nowhere else is DRIFTED, exit 0: a rename and a "
+          "renumber look the same")
+    check(document(report, "app.json")["drift"] == {
+        "renumbered": 0, "drifted": 4, "unusedBefore": []},
+          "the report document carries the drift counts")
+    broken_named = copy(app)
+    broken_named["widgets"]["widget_6"]["config"]["bookmarks"][0][
+        "mapDataSourceId"] = "dataSource_3"
+    check(describe(run(broken_named, named, inserted))[-1] ==
+          "VERDICT: 1 widget binding(s) point at a layer that does not exist. "
+          "3 widget binding(s) point at a layer id that now names another "
+          "layer: see RENUMBERED.",
+          "a verdict with both names the dangling and the renumbered")
+    # layerDefinition.source.mapLayerId says which service layer an entry
+    # draws, so the widget reads that layer.
+    drawn = index_webmap({"operationalLayers": [
+        {"id": "M", "layerType": "ArcGISMapServiceLayer", "url": svc_x,
+         "layers": [
+             {"id": 4, "name": "Hydrants", "layerDefinition": {
+                 "source": {"type": "mapLayer", "mapLayerId": 7}}},
+             {"id": 5, "name": "Valves", "layerDefinition": {
+                 "source": {"type": "mapLayer", "mapLayerId": 9}}},
+             {"id": 6, "name": "Mains", "layerDefinition": {
+                 "source": {"type": "mapLayer", "mapLayerId": 8}}},
+             {"id": 11, "name": "  ", "layerDefinition": {
+                 "source": {"type": "dataLayer"}}},
+             {"id": 12, "layerDefinition": 5}, "junk", {"name": "no id"}]}]})
+    check(drawn[1]["M"]["named"] == {"4": ("Hydrants", "7"),
+                                     "5": ("Valves", "9"),
+                                     "6": ("Mains", "8"),
+                                     "11": (None, "11"), "12": (None, "12")},
+          "a sublayer entry's name and the layer it draws are read from the "
+          "web map, and a blank name counts as none")
+    water = {svc_x: service_ids({"layers": [
+        {"id": 4, "name": "Hydrants"}, {"id": 7, "name": "Fittings"},
+        {"id": 8, "name": "Mains"}, {"id": 11, "name": "Meters"},
+        {"id": 12}]})}
+    got = judge_child("M-4", drawn, water)
+    check(got.status == RENUMBERED and "carries the name 'Hydrants' of "
+          "service layer 4 but draws layer 7, 'Fittings'" in got.reason,
+          "an entry named for one layer that draws another is RENUMBERED  "
+          "<-- pinned defect")
+    got = judge_child("M-5", drawn, water)
+    check(got.status == DANGLING and "draws service layer 9" in got.reason,
+          "an entry that draws a layer the service dropped is DANGLING")
+    check(judge_child("M-6", drawn, water).status == OK,
+          "an entry whose own id is not published but whose drawn layer "
+          "carries its name reads ok")
+    check([judge_child(c, drawn, water).status for c in ("M-11", "M-12")]
+          == [OK, OK], "an entry with no name, or a layer with no name, is "
+          "not judged by name")
+    # The service as it was before the republish closes the gap for apps
+    # whose web map records no names.
+    renum = copy(services)
+    renum[zoning] = {"layers": [{"id": n, "name": "Zoning %d" % n}
+                                for n in range(15)] +
+                     [{"id": 15, "name": "Parcels"},
+                      {"id": 16, "name": "Zoning 15"},
+                      {"id": 17, "name": "zoning 15"}]}
+    old = {"layers": [{"id": n, "name": "Zoning %d" % n} for n in range(16)]}
+    report = run(app, webmap, renum, before={zoning: lambda: old})
+    reason = [v.reason for _, r, v in report.findings
+              if r.dsid.endswith("layer-25-15")][0]
+    check(statuses(report)["dataSource_1-18f00000001-layer-25-15"] ==
+          RENUMBERED and exit_code(report) == 1 and
+          "the service before the republish (--before) calls it 'Zoning 15'"
+          in reason and "as layer 16 and 17" in reason,
+          "with --before, a republish that gives id 15 to another layer is "
+          "RENUMBERED, exit 1  <-- pinned defect")
+    hydrants = base + "/Hosted/Hydrants/FeatureServer"
+    moved_fs = copy(services)
+    moved_fs[hydrants] = {"layers": [{"id": 3, "name": "Valves"},
+                                     {"id": 2, "name": "Hydrants"}]}
+    report = run(app, webmap, moved_fs, before={hydrants: lambda: {
+        "layers": [{"id": 3, "name": "Hydrants"}]}})
+    check(statuses(report)["dataSource_1-18f00000003-layer-4"] == RENUMBERED,
+          "and so is a feature layer url whose index now names another layer")
+    report = run(app, webmap, services, before={
+        zoning: lambda: {"error": {"code": 403, "message": "denied"}},
+        base + "/Typo/MapServer": lambda: old})
+    lines = describe(report)
+    check(exit_code(report) == 2 and ("--before for service %s" % zoning,
+                                      "error 403: denied") in report.unread,
+          "a --before file that cannot be read is unread, exit 2, not a "
+          "silent skip")
+    check(report.unused_before == [base + "/Typo/MapServer"] and
+          "NOTE         --before %s/Typo/MapServer was not compared: no "
+          "reference needs that service, so check the url" % base in lines,
+          "a --before url no reference needs is named, so a typo cannot pass "
+          "as a clean comparison  <-- pinned defect")
+    report = run(app, webmap, {}, before={zoning: lambda: old})
+    check(report.unread[0][0].startswith("service ") and not [
+        u for u in report.unread if u[0].startswith("--before")],
+          "a --before is not read for a service that could not be read")
+
     # ---- small helpers
     check(service_root("https://h/a/MapServer/3/?x=1") ==
           ("https://h/a/MapServer", "3") and
@@ -2644,6 +3673,542 @@ def self_test():
     finally:
         sys.argv = argv_before
 
+    # ---- dashboards (dashlint): a widget bound to data it cannot read
+    item_a = "a" * 32
+    item_b = "b" * 32
+    dash_wm = "c" * 32
+    arc = "d" * 32
+    orders_url = base + "/Hosted/Orders/FeatureServer"
+
+    def dash_fixture():
+        def fields(*pairs):
+            return {"fields": [{"name": n, "type": "esriFieldType" + t}
+                               for n, t in pairs]}
+
+        def ds(item, lid, name="main", **extra):
+            out = {"type": "serviceDataset", "name": name,
+                   "dataSource": {"type": "layerDataSource", "itemId": item,
+                                  "layerId": lid},
+                   "groupByFields": [], "orderByFields": [],
+                   "statisticDefinitions": [], "outFields": ["*"]}
+            out.update(extra)
+            return out
+
+        def stat(field, alias="value", kind="count"):
+            return {"onStatisticField": field, "statisticType": kind,
+                    "outStatisticFieldName": alias}
+
+        def tgt(wid, name="main", fm=None, req=False):
+            out = {"targetId": "%s#%s" % (wid, name), "by": "whereClause",
+                   "requiresSelection": req}
+            if fm:
+                out["fieldMap"] = [{"sourceName": a, "targetName": b}
+                                   for a, b in fm]
+            return out
+
+        def events(*targets):
+            return [{"type": "selectionChanged", "actions": [
+                {"type": "filter", "targets": list(targets)}]}]
+        orders = fields(("OBJECTID", "OID"), ("status", "String"),
+                        ("crew", "String"), ("opened", "Date"),
+                        ("cost", "Double"), ("priority", "SmallInteger"))
+        crews = fields(("OBJECTID", "OID"), ("crew_name", "String"),
+                       ("district", "Integer"))
+        status_rule = {"type": "filterGroup", "condition": "AND", "rules": [
+            {"type": "filterGroup", "rules": [
+                {"type": "filterRule", "operator": "equal",
+                 "field": {"name": "status", "type": "string"},
+                 "constraint": {"type": "value", "value": "open"}}]}]}
+        dash = {"version": 55, "desktopView": {"widgets": [
+            {"id": "w-table", "type": "tableWidget", "name": "Open orders",
+             "datasets": [ds(item_a, 0, filter=status_rule,
+                             orderByFields=["opened DESC"])],
+             "dataSettings": {"type": "features",
+                              "valueFields": ["status", "crew", "cost"]}},
+            {"id": "w-chart", "type": "serialChartWidget",
+             "name": "Crews by district", "categoryType": "groupByValues",
+             "category": {"fieldName": "district"},
+             "splitBy": {"defaultColor": "#d6d6d6"},
+             "graphs": [{"valueField": "value"}],
+             "datasets": [ds(item_b, 1, groupByFields=["district"],
+                             statisticDefinitions=[stat("ESRI_OID")],
+                             orderByFields=["value DESC"])]},
+            {"id": "w-ind", "type": "indicatorWidget", "name": "Open cost",
+             "datasets": [ds(dash_wm, "18f00000010-layer-2",
+                             statisticDefinitions=[stat("cost", "value",
+                                                        "sum")])]},
+            {"id": "w-map", "type": "mapWidget", "name": "Map",
+             "itemId": dash_wm},
+            {"id": "w-list", "type": "listWidget", "name": "Notes",
+             "datasets": [{"type": "serviceDataset", "name": "main",
+                           "dataSource": {"type": "arcadeDataSource",
+                                          "itemId": arc}}]},
+            {"id": "w-text", "type": "richTextWidget", "name": "Header"}],
+            "header": {"selectors": [
+                {"id": "w-crew", "type": "categorySelectorWidget",
+                 "name": "Crew",
+                 "datasets": [ds(item_a, 0, groupByFields=["crew"],
+                                 statisticDefinitions=[stat("ESRI_OID")])],
+                 "events": events(
+                     tgt("w-table"), tgt("w-chart", fm=[("crew",
+                                                         "crew_name")]),
+                     tgt("w-map", "18f00000010-layer-2",
+                         fm=[("crew", "crew")]),
+                     tgt("w-ind", fm=[("crew", "crew")]))}]}},
+            "mobileView": {"widgets": [
+                {"id": "m-table", "type": "tableWidget", "name": "Open orders",
+                 "datasets": [ds(item_a, 0)],
+                 "dataSettings": {"valueFields": ["status"]}},
+                {"id": "m-crew", "type": "categorySelectorWidget",
+                 "name": "Crew",
+                 "datasets": [ds(item_a, 0, groupByFields=["crew"],
+                                 statisticDefinitions=[stat("ESRI_OID")])],
+                 "events": events(tgt("m-table", req=True))}]},
+            "arcadeDataSourceItems": [{"type": "arcadeItem", "itemId": arc,
+                                       "name": "notes", "script": "x"}]}
+        dash_map = {"operationalLayers": [
+            {"id": "Group_1", "layerType": "GroupLayer", "layers": [
+                {"id": "18f00000010-layer-2", "title": "Orders",
+                 "layerType": "ArcGISFeatureLayer", "url": orders_url + "/0"}]},
+            {"id": "18f00000011-layer-3",
+             "layerType": "ArcGISMapServiceLayer", "url": base +
+             "/Ref/MapServer"},
+            {"id": "18f00000012-layer-4", "layerType": "SubtypeGroupLayer",
+             "url": orders_url + "/0"},
+            {"id": "18f00000013-layer-5", "layerType": "ArcGISFeatureLayer",
+             "title": "Sketch notes"}]}
+        layers = {(item_a, "0"): orders, (item_b, "1"): crews,
+                  (dash_wm, "18f00000010-layer-2"): orders,
+                  (dash_wm, "18f00000013-layer-5"): orders}
+        svcs = {item_a: {"layers": [{"id": 0}]},
+                item_b: {"layers": [{"id": 1}]}}
+        return dash, dash_map, layers, svcs, stat, tgt
+
+    dash, dash_map, dash_layers, dash_svcs, stat, tgt = dash_fixture()
+
+    def dash_run(doc, webmaps=None, layers=None, svcs=None):
+        webmaps = {dash_wm: dash_map} if webmaps is None else webmaps
+        layers = dash_layers if layers is None else layers
+        svcs = dash_svcs if svcs is None else svcs
+
+        def wm_get(item):
+            if item not in webmaps:
+                raise Unread("no web map")
+            return webmaps[item]
+
+        def layer_get(item, lid, entry):
+            if entry is None and lid not in service_ids(svcs[item]):
+                raise Removed("item %s has no layer %s" % (item, lid))
+            if (item, lid) not in layers:
+                raise Unread("no layer")
+            ident = "%s/%s" % entry["check"] if entry and entry["check"] \
+                else None
+            return Layer(layer_fields(layers[(item, lid)]), ident)
+        return dash_audit(lambda: doc, wm_get, layer_get)
+
+    def found(result):
+        return sorted((f[0], f[1]) for f in result[0])
+
+    result = dash_run(dash)
+    check(result[0] == [] and dash_exit(result[0], result[2]) == 0 and
+          result[1] == {"widgets": 9, "datasets": 7, "targets": 5} and
+          result[3] == (1, 1, 3, 3),
+          "dashboards: the clean dashboard has no finding and exits 0 after "
+          "reading 9 widgets, 7 datasets, 5 targets, a web map and 3 layers")
+    check(dash_describe(*result)[-1] == "VERDICT: every widget reads data "
+          "its layer returns.", "and its verdict says so")
+
+    def mutate(edit):
+        doc = copy(dash)
+        edit(doc)
+        return found(dash_run(doc))
+    desk = "desktopView"
+
+    def w(doc, n):
+        return doc[desk]["widgets"][n]
+
+    def sel(doc):
+        return doc[desk]["header"]["selectors"][0]
+    # Rule 1, layer-gone.
+    check(found(dash_run(dash, svcs={item_a: {"layers": [{"id": 5}]},
+                                     item_b: dash_svcs[item_b]}))
+          == [(BROKEN, "layer-gone")] * 4,
+          "layer-gone: a layer its item no longer publishes is BROKEN for "
+          "each of the 4 widgets that read it")
+    gone_map = copy(dash_map)
+    del gone_map["operationalLayers"][0]
+    check(mutate(lambda d: None) == [] and found(dash_run(dash, webmaps={
+        dash_wm: gone_map})) == [(BROKEN, "layer-gone"),
+                                 (BROKEN, "target-gone")],
+          "layer-gone and target-gone: a layer the web map dropped breaks "
+          "the widget and the map filter that name it")
+    # Rule 2, field-gone, in every place a dataset names a field.
+    for where, edit in (
+            ("groups by", lambda d: w(d, 1)["datasets"][0].update(
+                groupByFields=["district", "zone"])),
+            ("a statistic reads", lambda d: w(d, 2)["datasets"][0].update(
+                statisticDefinitions=[stat("amount")])),
+            ("asks for", lambda d: w(d, 0)["datasets"][0].update(
+                outFields=["status", "*", "notes", 7])),
+            ("sorts by", lambda d: w(d, 0)["datasets"][0].update(
+                orderByFields=["closed ASC"])),
+            ("filters on", lambda d: w(d, 0)["datasets"][0]["filter"][
+                "rules"][0]["rules"][0]["field"].update(name="state")),
+            ("field map emits", lambda d: sel(d)["events"][0]["actions"][0][
+                "targets"][1]["fieldMap"][0].update(sourceName="status")),
+            ("field map filters", lambda d: sel(d)["events"][0]["actions"][0][
+                "targets"][2]["fieldMap"][0].update(targetName="crew_name"))):
+        doc = copy(dash)
+        edit(doc)
+        result = dash_run(doc)
+        check(found(result) == [(BROKEN, "field-gone")] and
+              where in result[0][0][5] and dash_exit(result[0], []) == 1,
+              "field-gone (%s): a field the layer does not have is "
+              "BROKEN, exit 1" % where)
+    check(mutate(lambda d: w(d, 0)["datasets"][0]["filter"]["rules"].extend(
+        ["junk", {"type": "filterRule", "field": 5},
+         {"type": "filterRule", "field": {"name": 5}}])) == [],
+          "a filter rule with no field name is skipped, not a crash")
+    # Rule 3, filter-type.
+    check(mutate(lambda d: w(d, 0)["datasets"][0]["filter"]["rules"][0][
+        "rules"][0]["field"].update(type="integer")) ==
+          [(BROKEN, "filter-type")],
+          "filter-type: a string field filtered as an integer is BROKEN")
+    check(mutate(lambda d: w(d, 0)["datasets"][0]["filter"]["rules"].append(
+        {"type": "filterRule", "field": {"name": "OBJECTID",
+                                         "type": "string"}})) == [] and
+          mutate(lambda d: w(d, 0)["datasets"][0]["filter"]["rules"].append(
+              {"type": "filterRule", "field": {"name": "ESRI_OID",
+                                               "type": "string"}})) == [],
+          "and a field of a type it does not map, or the virtual ESRI_OID, "
+          "is not judged")
+    # Rule 4, series-unbound.
+    check(mutate(lambda d: w(d, 1)["category"].update(fieldName="crew_name"))
+          == [(BROKEN, "series-unbound")] and
+          mutate(lambda d: w(d, 1)["splitBy"].update(fieldName="crew_name"))
+          == [(BROKEN, "series-unbound")] and
+          mutate(lambda d: w(d, 1)["graphs"].append({"valueField": "total"}))
+          == [(BROKEN, "series-unbound")],
+          "series-unbound: a grouped chart's category, split or value that "
+          "its query does not return is BROKEN")
+    check(mutate(lambda d: w(d, 1).update(categoryType="features")) ==
+          [(BROKEN, "series-unbound")],
+          "and a features chart whose query groups its rows is BROKEN")
+
+    def features_chart(d):
+        w(d, 1).update(categoryType="features", graphs=[
+            {"valueField": "crew_name"}, {"valueField": "OBJECTID"}, "junk"])
+        w(d, 1)["datasets"][0].update(groupByFields=[],
+                                      statisticDefinitions=[],
+                                      orderByFields=[])
+    check(mutate(features_chart) == [] and
+          mutate(lambda d: (features_chart(d), w(d, 1)["graphs"].append(
+              {"valueField": "cost"}))) == [(BROKEN, "series-unbound")],
+          "and a features chart reads raw fields, so one the layer lacks "
+          "is BROKEN")
+    check(mutate(lambda d: w(d, 1).update(categoryType="fields",
+                                          graphs=[{"valueField": "x"}])) ==
+          [], "a fields chart, whose names are made up, is not judged")
+    # Rule 5, column-unreturned.
+    check(mutate(lambda d: w(d, 0)["dataSettings"]["valueFields"].append(
+        "closed")) == [(BROKEN, "column-unreturned")],
+          "column-unreturned: a table column the layer does not have is "
+          "BROKEN")
+    check(mutate(lambda d: w(d, 0)["datasets"][0].update(
+        outFields=["status", "crew"])) == [(BROKEN, "column-unreturned")],
+          "and so is one its query leaves out of outFields")
+
+    def grouped_table(d):
+        w(d, 0)["datasets"][0].update(groupByFields=["crew"],
+                                      statisticDefinitions=[
+                                          stat("cost", "total", "sum")],
+                                      orderByFields=[])
+        w(d, 0)["dataSettings"]["valueFields"] = ["crew", "total"]
+    check(mutate(grouped_table) == [] and
+          mutate(lambda d: (grouped_table(d), w(d, 0)["dataSettings"][
+              "valueFields"].append("status"))) ==
+          [(BROKEN, "column-unreturned")],
+          "and a grouped table can show only its group-by fields and "
+          "statistics: a raw field is BROKEN")
+    # Rule 12, stat-unshown.
+    check(mutate(lambda d: (grouped_table(d), w(d, 0)["dataSettings"][
+        "valueFields"].remove("total"))) == [(WARN, "stat-unshown")],
+          "stat-unshown: a grouped table that computes a statistic and shows "
+          "no column for it is a WARN")
+    # Rule 6, arcade-gone.
+    check(mutate(lambda d: d.pop("arcadeDataSourceItems")) ==
+          [(BROKEN, "arcade-gone")],
+          "arcade-gone: an Arcade data source the dashboard no longer "
+          "defines is BROKEN")
+    check(mutate(lambda d: (d.pop("arcadeDataSourceItems"), d.update(
+        dataExpressions=[{"id": arc}, "junk"], arcadeDataSourceItems=5)))
+          == [], "and the older dataExpressions key is read too")
+    # Rules 7 and 8, target-gone and target-dataset-gone.
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][0]
+                 .update(targetId="w-gone#main")) ==
+          [(BROKEN, "target-gone")] and
+          mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][0]
+                 .update(targetId=None)) == [(BROKEN, "target-gone")],
+          "target-gone: a filter whose target widget is gone is BROKEN")
+    check(mutate(lambda d: d["mobileView"]["widgets"][1]["events"][0][
+        "actions"][0]["targets"][0].update(targetId="w-table#main")) ==
+          [(BROKEN, "target-gone")],
+          "and a mobile filter cannot reach a desktop widget  "
+          "<-- pinned defect")
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][2]
+                 .update(targetId="w-map#18f00000099-layer-9")) ==
+          [(BROKEN, "target-gone")],
+          "and so is a map filter on a layer the web map does not hold")
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][0]
+                 .update(targetId="w-table#reference")) ==
+          [(BROKEN, "target-dataset-gone")],
+          "target-dataset-gone: a filter on a dataset its widget lacks is "
+          "BROKEN")
+    # Rule 9, cross-no-fieldmap.
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][1]
+                 .pop("fieldMap")) == [(BROKEN, "cross-no-fieldmap")],
+          "cross-no-fieldmap: a filter on another layer with no field map "
+          "is BROKEN  <-- pinned defect")
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][1]
+                 .update(by="geometry", fieldMap=None)) == [],
+          "and a spatial filter needs no field map")
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"].append(
+        tgt("w-list"))) == [(BROKEN, "cross-no-fieldmap")],
+          "and so is one from a layer onto an Arcade source")
+    # Rules 10 and 11, the two observed warnings.
+    check(mutate(lambda d: sel(d)["events"][0]["actions"][0]["targets"][1][
+        "fieldMap"].extend([{"sourceName": "value", "targetName":
+                             "district"}, "junk"])) ==
+          [(WARN, "fieldmap-many")],
+          "fieldmap-many: a filter that maps two fields is a WARN")
+
+    def two_required(d):
+        sel(d)["events"][0]["actions"][0]["targets"][0]["requiresSelection"] \
+            = True
+        w(d, 1)["events"] = [{"actions": [{"targets": [
+            dict(tgt("w-table"), requiresSelection=True, fieldMap=[
+                {"sourceName": "district", "targetName": "priority"}])]}]}]
+    check(mutate(two_required) == [(WARN, "selection-and")],
+          "selection-and: a widget that requires a selection from a chart "
+          "and a selector is a WARN")
+    check(mutate(lambda d: (two_required(d), w(d, 1).update(
+        type="categorySelectorWidget"))) == [],
+          "and two selectors requiring together are fine")
+    # Same layer by url: a web map layer and its feature layer item.
+    ident = Layer({"crew": ("crew", "")}, orders_url + "/0")
+    flagged = []
+    _field_map({"by": "whereClause"},
+               (("layerDataSource", item_a, "0"), ident, False, set()),
+               (("layerDataSource", dash_wm, "x"), ident, False, set()),
+               lambda *a: flagged.append(a))
+    check(flagged == [], "a filter between two keys for the same layer url "
+          "needs no field map")
+    # Not audited and unjudged.
+    check(mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+        layerId="18f00000012-layer-4")) == [(NOT_AUDITED, "")] and
+          mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+              layerId="18f00000011-layer-3")) == [(NOT_AUDITED, "")] and
+          mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+              layerId="18f00000011-layer-3-2")) == [(NOT_AUDITED, "")],
+          "a subtype group layer, a map image layer and its sublayer are NOT "
+          "AUDITED, never BROKEN")
+    check(mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+        type="featureServiceDataSource")) == [(NOT_AUDITED, "")] and
+          mutate(lambda d: w(d, 2)["datasets"][0].update(dataSource=5)) ==
+          [(NOT_AUDITED, "")],
+          "and so is a data source type this tool does not model")
+    check(mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+        layerId="18f00000013-layer-5")) == [],
+          "a web map layer read from a --dash-layer file is judged")
+    check(mutate(lambda d: w(d, 2)["datasets"][0]["dataSource"].update(
+        layerId=None)) == [(UNJUDGED, "")] and
+          mutate(lambda d: w(d, 2)["datasets"].extend([5, {}])) ==
+          [(NOT_AUDITED, "")],
+          "a dataset with no layer id is UNJUDGED, and a junk entry is "
+          "skipped")
+    result = dash_run(dash, webmaps={})
+    check(found(result) == [(UNJUDGED, "")] * 2 and
+          result[2] == [("web map %s" % dash_wm, "no web map")] and
+          dash_exit(result[0], result[2]) == 2 and
+          dash_describe(*result)[-1] == "VERDICT: INCOMPLETE. Something "
+          "could not be read, so this run proves nothing about it.",
+          "a web map that cannot be read is unread, its layer and map target "
+          "UNJUDGED, exit 2")
+    result = dash_run(dash, layers={})
+    check(len(result[0]) == 7 and set(f[0] for f in result[0]) ==
+          set([UNJUDGED]) and result[3] == (1, 1, 0, 3),
+          "a layer that cannot be read is UNJUDGED once per dataset, never "
+          "clean  <-- pinned defect")
+    result = dash_run({"error": {"code": 400, "message": "gone"}})
+    check(result[2] == [("dashboard", "error 400: gone")] and
+          dash_exit(result[0], result[2]) == 2,
+          "a dashboard error body is unread, exit 2")
+    raises(lambda: check_dashboard({"widgets": {}}),
+           "a document with no desktopView and no widgets array is not a "
+           "dashboard", Unread)
+    check(check_dashboard({"widgets": []}) == {"widgets": []},
+          "an older dashboard with a top-level widgets array is read")
+    raises(lambda: layer_fields({"fields": []}), "a layer with no fields is "
+           "unread, not a layer that has none", Unread)
+    raises(lambda: layer_fields({"error": {"code": 499, "message": "x"}}),
+           "a layer error body is unread", Unread)
+    check(layer_fields({"fields": [{"name": "A", "type": "t"}, 5, {}]}) ==
+          {"a": ("A", "t")}, "layer fields are keyed by lower-case name")
+    check(_bare("value  desc") == "value" and _bare("ASC") == "ASC",
+          "an order-by entry loses only a trailing ASC or DESC")
+    check(dash_webmaps({"desktopView": {"widgets": [
+        {"id": "m", "type": "mapWidget", "itemId": dash_wm},
+        {"id": "x", "type": "listWidget", "datasets": [
+            5, {"dataSource": 5},
+            {"dataSource": {"itemId": item_a, "layerId": "7"}},
+            {"dataSource": {"itemId": item_b, "layerId": "L-1"}}]},
+        {"id": "y", "type": "listWidget", "datasets": 5}]}}) ==
+          set([dash_wm, item_b]), "the web maps a dashboard reads are its "
+          "map widgets' items and the items of its web map datasets")
+    check(len(dash_widgets({"desktopView": {"widgets": [
+        {"id": 5, "type": "listWidget"}, {"id": "a", "type": "panel"},
+        {"id": "b", "type": "listWidget"}]}})) == 1,
+          "only an object with a string id and a Widget type is a widget")
+    # The printed lines and the report document.
+    doc = copy(dash)
+    sel(doc)["events"][0]["actions"][0]["targets"][1].pop("fieldMap")
+    sel(doc)["events"][0]["actions"][0]["targets"][1]["fieldMap"] = [
+        {"sourceName": "crew", "targetName": "crew_name"}, {}]
+    w(doc, 1)["category"]["fieldName"] = "crew_name"
+    result = dash_run(doc)
+    lines = dash_describe(*result)
+    check(lines[-1] == "VERDICT: 1 finding(s) bind a widget to data it "
+          "cannot read." and "findings: 1 broken, 0 unjudged, 0 not audited, "
+          "1 warn" in lines and "BROKEN       series-unbound" in lines and
+          lines.index("BROKEN       series-unbound") <
+          lines.index("WARN         fieldmap-many"),
+          "the report puts BROKEN before WARN and counts both")
+    paper = dash_document(*(result[:3] + ("dash.json",)))
+    check(paper["exit"] == 1 and paper["mode"] == "dashboard" and
+          paper["counts"]["broken"] == 1 and paper["counts"]["warn"] == 1 and
+          paper["counts"]["datasets"] == 7 and
+          paper["findings"][0]["rule"] == "series-unbound",
+          "the dashboard report document carries the exit, the counts and the "
+          "findings")
+    lines = dash_describe([(WARN, "x", "desktop", "p", "l", "r")],
+                          result[1], [], (0, 0, 0, 0))
+    check(lines[-1] == "VERDICT: every widget reads data its layer returns. "
+          "See the 1 WARN finding(s).", "a WARN alone does not fail the run")
+    lines = dash_describe([(NOT_AUDITED, "", "desktop", "p", "l", "r")],
+                          result[1], [], (0, 0, 0, 0))
+    check(lines[-1] == "VERDICT: INCOMPLETE. 1 dataset(s) are of a kind this "
+          "tool does not audit, so this run proves nothing about them." and
+          "-" in [x.split()[-1] for x in lines if x.startswith("NOT AUDITED")],
+          "a dataset that is not audited makes the run incomplete, exit 2")
+    lines = dash_describe([], result[1], [("dashboard", "boom")],
+                          (0, 0, 0, 0))
+    check("1 input(s) COULD NOT BE READ, so they are not clean, they are "
+          "unknown:" in lines, "an unread dashboard is named")
+    doc = copy(dash)
+    doc["mobileView"]["widgets"][1]["events"] = [5, {"actions": 5}, {
+        "actions": [5, {"targets": 5}, {"targets": [5]}]}]
+    check(dash_run(doc)[1]["targets"] == 4,
+          "malformed events, actions and targets are skipped, not a crash")
+    check(dash_run({"desktopView": {"widgets": [
+        {"id": "s", "type": "listWidget", "events": [{"actions": [
+            {"targets": [{"targetId": "t#main", "by": "whereClause"}]}]}]},
+        {"id": "t", "type": "listWidget", "datasets": [{"name": "main"}]}]}}
+    )[0][0][:2] == (NOT_AUDITED, ""),
+          "a filter from a widget with no dataset, onto one that is not "
+          "audited, is not judged twice")
+    unjudged_map = copy(dash)
+    sel(unjudged_map)["events"][0]["actions"][0]["targets"][2][
+        "targetId"] = "w-map#18f00000012-layer-4"
+    check(found(dash_run(unjudged_map)) == [(UNJUDGED, "")],
+          "a map filter on a layer kind that is not audited is UNJUDGED")
+
+    # ---- dashboards on the command line, offline
+    dash_file = put("dash.json", dash)
+    dash_map_file = put("dash_map.json", dash_map)
+    dash_args = ["--webmap", dash_map_file]
+    for (item, lid), body in sorted(dash_layers.items()):
+        dash_args += ["--dash-layer", "%s/%s=%s" % (item, lid, put(
+            "lyr_%s_%s.json" % (item[:4], lid), body))]
+    for item, body in sorted(dash_svcs.items()):
+        dash_args += ["--dash-service", "%s=%s" % (item, put(
+            "svc_%s.json" % item[:4], body))]
+    code, out, err = run_cli([dash_file, "--dashboard"] + dash_args)
+    check(code == 0 and "deadwidget: dashboard, 9 widget(s), 7 dataset(s), "
+          "5 action target(s)" in out and "VERDICT: every widget reads data "
+          "its layer returns." in out,
+          "offline: --dashboard lints the clean dashboard and exits 0, with "
+          "the one web map bound without its item id")
+    bad_dash = copy(dash)
+    sel(bad_dash)["events"][0]["actions"][0]["targets"][1].pop("fieldMap")
+    bad_dash_file = put("bad_dash.json", bad_dash)
+    code, out, err = run_cli([bad_dash_file, "--dashboard"] + dash_args)
+    check(code == 1 and "BROKEN       cross-no-fieldmap" in out,
+          "offline: a filter with no field map onto another layer exits 1")
+    code, out, err = run_cli([dash_file, "--dashboard"] + dash_args + [
+        "--dash-service", "%s=%s" % (item_a, put("svc_a5.json", {"layers": [
+            {"id": 5}]}))])
+    check(code == 1 and "does not publish layer 0" in out,
+          "offline: --dash-service tells a removed layer from an unread one")
+    code, out, err = run_cli([dash_file, "--dashboard"])
+    check(code == 2 and "no --dash-layer file was given for %s/0" % item_a
+          in out and "no --webmap file was given" in out,
+          "offline: a layer or web map no file covers is unread, exit 2")
+    report_file = os.path.join(tmp, "dash_report.json")
+    code, out, err = run_cli([bad_dash_file, "--dashboard", "--out",
+                              report_file, "--apply"] + dash_args)
+    written = read_json_file(report_file)
+    check(code == 1 and written["mode"] == "dashboard" and
+          written["counts"]["broken"] == 1,
+          "offline: --out with --apply writes the dashboard report")
+    code, out, err = run_cli([bad_dash_file, "--dashboard", "--out",
+                              dash_args[3].split("=", 1)[1], "--apply"]
+                             + dash_args)
+    check(code == 64 and read_json_file(dash_args[3].split("=", 1)[1]) ==
+          dash_layers[(item_a, "0")],
+          "offline: --out naming a --dash-layer file is refused and the file "
+          "is kept  <-- pinned defect")
+    code, out, err = run_cli([os.path.join(tmp, "absent.json"),
+                              "--dashboard", "--webmap", "x.json"])
+    check(code == 2 and "COULD NOT BE READ" in out,
+          "offline: a missing dashboard file exits 2, not a usage error")
+    for argv, words in (
+            ([dash_file, "--dashboard", "--resource", dash_file],
+             "Experience Builder inputs"),
+            ([dash_file, "--dash-layer", "x"], "need --dashboard"),
+            ([dash_file, "--dashboard", "--dash-layer", item_a + "=f"],
+             "--dash-layer takes ITEMID/LAYERID=FILE"),
+            ([dash_file, "--dashboard", "--dash-service",
+              item_a + "/0=f"], "--dash-service takes ITEMID=FILE"),
+            ([dash_file, "--dashboard", "--dash-layer", "x/0=f"],
+             "--dash-layer takes"),
+            ([dash_file, "--dashboard", "--dash-layer", item_a + "/=f"],
+             "--dash-layer takes"),
+            ([dash_file, "--dashboard", "--webmap", "a.json", "--webmap",
+              "b.json"], "cannot tell which web map"),
+            ([dash_file, "--dashb"], "unrecognized arguments")):
+        code, out, err = run_cli(argv)
+        check(code == 64 and words in err, "offline: %s is a usage error "
+              "naming the fix" % " ".join(a for a in argv[1:]
+                                          if a.startswith("--")))
+    # --before on the command line, offline.
+    before_file = put("before.json", {"layers": [{"id": 3,
+                                                  "name": "Hydrants"}]})
+    after = copy(services)
+    after[hydrants] = {"layers": [{"id": 3, "name": "Valves"},
+                                  {"id": 4, "name": "Hydrants"}]}
+    after_args = []
+    for url in sorted(after):
+        after_args += ["--service", "%s=%s" % (url, put(
+            "after%d.json" % len(after_args), after[url]))]
+    code, out, err = run_cli([app_file, "--webmap", wm_file, "--before",
+                              "%s=%s" % (hydrants, before_file)] + after_args)
+    check(code == 1 and "RENUMBERED   dataSource_1-18f00000003-layer-4" in out
+          and "now publishes 'Hydrants' as layer 4" in out,
+          "offline: --before turns a feature layer whose index moved into "
+          "RENUMBERED, exit 1")
+    check(run_cli([app_file, "--before", "nothing"])[0] == 64,
+          "offline: a malformed --before is a usage error")
+
     # ---- the token gate in online mode, with http_json stubbed. The
     # loopback portal below cannot test it: loopback may have the token.
     sent = []
@@ -2916,6 +4481,79 @@ def self_test():
               "not be read" in out and "only http and https" in out,
               "online: a web map layer with a file: url leaves its sublayers "
               "UNJUDGED and fetches nothing  <-- pinned defect")
+        # ---- dashboards online: the item, then its service, then the layer
+        dash_id = "e" * 32
+        live_base = live + "/server/rest/services"
+        live_map = json.loads(json.dumps(dash_map).replace(base, live_base))
+        orders_live = live_base + "/Hosted/Orders/FeatureServer"
+        crews_live = live_base + "/Hosted/Crews/FeatureServer"
+
+        def dash_routes(doc=None):
+            reset()
+            routes[rest + dash_id + "/data"] = (200, dash if doc is None
+                                                else doc)
+            routes[rest + dash_wm + "/data"] = (200, live_map)
+            routes[rest + item_a] = (200, {"url": orders_live})
+            routes[rest + item_b] = (200, {"url": crews_live + "/1"})
+            for url, body in ((orders_live, {"layers": [{"id": 0}]}),
+                              (crews_live, {"layers": [{"id": 1}]}),
+                              (orders_live + "/0", dash_layers[(item_a, "0")]),
+                              (crews_live + "/1", dash_layers[(item_b, "1")])):
+                routes[urllib.parse.urlsplit(url).path] = (200, body)
+        dash_online = ["--portal", live + "/", "--item", dash_id,
+                       "--dashboard"]
+        dash_routes()
+        code, out, err = run_cli(dash_online + ["--token", token])
+        check(code == 0 and "web maps read: 1 of 1, layers read: 3 of 3" in out
+              and len(seen) == 9 and all(s[2].get("token") == token
+                                         for s in seen) and token not in out,
+              "online: --dashboard reads the dashboard, each layer item, its "
+              "service and layer, and the web map, with the token, and exits 0")
+        dash_routes()
+        routes[urllib.parse.urlsplit(orders_live).path] = (
+            200, {"layers": [{"id": 5}]})
+        code, out, err = run_cli(dash_online)
+        check(code == 1 and "BROKEN       layer-gone" in out and
+              "no longer publishes layer 0" in out and
+              "BROKEN       target-gone" in out,
+              "online: a layer the service dropped is BROKEN, not unread")
+        dash_routes()
+        routes[urllib.parse.urlsplit(orders_live).path] = (500, "boom")
+        code, out, err = run_cli(dash_online)
+        check(code == 2 and out.count("could not be read: service %s could "
+                                      "not be read" % orders_live) == 5 and
+              len([s for s in seen if s[1] == urllib.parse.urlsplit(
+                  orders_live).path]) == 1,
+              "online: a service that cannot be read leaves every dataset on "
+              "it UNJUDGED, and is asked once")
+        dash_routes()
+        routes[rest + item_b] = (200, {"error": {"code": 403,
+                                                 "message": "denied"}})
+        code, out, err = run_cli(dash_online)
+        check(code == 2 and "its layer could not be read: error 403: denied"
+              in out, "online: a layer item that cannot be read is UNJUDGED")
+        dash_routes()
+        routes[rest + item_b] = (200, {"title": "no url"})
+        code, out, err = run_cli(dash_online)
+        check(code == 2 and "names no map or feature service url" in out,
+              "online: a layer item with no service url is UNJUDGED")
+        odd = copy(dash)
+        odd["desktopView"]["widgets"][2]["datasets"][0]["dataSource"][
+            "layerId"] = "18f00000013-layer-5"
+        odd["desktopView"]["widgets"][1]["datasets"][0]["dataSource"][
+            "itemId"] = "../etc"
+        odd["desktopView"]["widgets"].append(
+            {"id": "w-x", "type": "listWidget", "datasets": [
+                {"name": "main", "dataSource": {
+                    "type": "layerDataSource", "itemId": "../web",
+                    "layerId": "L-1"}}]})
+        dash_routes(odd)
+        code, out, err = run_cli(dash_online)
+        check(code == 2 and "names no feature layer url" in out and
+              out.count("not an item id, so it was not fetched") == 2 and
+              not [s for s in seen if ".." in s[1]],
+              "online: a web map layer with no url, and an id that is not an "
+              "item id, are UNJUDGED and never fetched")
     finally:
         server.shutdown()
         server.server_close()
