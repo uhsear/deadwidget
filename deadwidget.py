@@ -1027,7 +1027,8 @@ def _parse(argv):
         prog="deadwidget.py",
         description="Find the Experience Builder widgets bound to a layer "
                     "that no longer exists.",
-        epilog="Read-only. Nothing is written without --apply.")
+        epilog="Read-only. Nothing is written without --apply.",
+        allow_abbrev=False)
     ap.add_argument("app", nargs="?", metavar="APP_JSON",
                     help="the app's item /data, the published copy, saved "
                          "as JSON (offline mode)")
@@ -2575,6 +2576,13 @@ def self_test():
     check(code == 1 and "Check only" in out and
           not os.path.exists(report_file),
           "--out without --apply writes nothing at all  <-- pinned defect")
+    prefix_file = os.path.join(tmp, "prefix.json")
+    code, out, err = run_cli([broken_file, "--webmap", wm_file,
+                              "--out", prefix_file, "--ap"] + svc_args)
+    check(code == 64 and "unrecognized arguments" in err and
+          not os.path.exists(prefix_file),
+          "a unique prefix of --apply, --ap, is refused and writes nothing  "
+          "<-- pinned defect")
     code, out, err = run_cli([broken_file, "--webmap", wm_file,
                               "--out", report_file, "--apply"] + svc_args)
     written = read_json_file(report_file)

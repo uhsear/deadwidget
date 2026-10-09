@@ -124,17 +124,17 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-283 assertions, 0 failed
+284 assertions, 0 failed
 ```
 
-The full run prints all 283 assertions. The `...` lines above are where this block is cut.
+The full run prints all 284 assertions. The `...` lines above are where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 283 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
+The same 284 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
 with `-W error`, and the three runs print identical output.
 Branch coverage of `deadwidget.py` under `--self-test` is 100 percent, with no line excluded.
 
