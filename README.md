@@ -1,6 +1,7 @@
 # deadwidget
 
-Find the Experience Builder widgets that are bound to a layer that no longer exists.
+Find the Experience Builder widgets that are bound to a layer that no longer exists or was
+renumbered, and the Dashboards widgets that are bound to data they cannot read.
 
 Somebody tidies a web map and removes a sublayer nobody seems to use. A week later somebody
 republishes a map service with fewer sublayers, and the old ids at the end of the list are gone.
@@ -9,9 +10,14 @@ loads, and the map draws. The search widget, the table and the "near me" panel t
 those sublayers now point at nothing. In production, a user clicks the widget and nothing
 happens. Nobody sees an error, because none is raised.
 
-This tool finds a binding whose layer id no longer exists. A renumber that gives an old id to a
-different layer is another failure, because the widget then reads the wrong layer. This tool does
-not find that one. Limits says why.
+This tool finds a binding whose layer id no longer exists. It also finds a renumber: a republish
+that gives an old id to a different layer, so the widget reads the wrong layer. An id cannot show
+a renumber, because the old id still exists. Only a recorded name can. The tool uses the name that
+the web map records for a sublayer, or the service description that you saved before the republish
+(`--before`). With no recorded name it checks that the id exists, and the report says so. It also
+warns when the web map hides a sublayer that a widget reads. With `--dashboard` it lints an ArcGIS
+Dashboards item with twelve rules, for example a chart series bound to a field that its dataset
+does not return.
 
 The link that broke is a string in the app configuration, such as
 `dataSource_1-18f00000001-layer-25-15`. That string means "the web map data source, then web map
@@ -25,6 +31,11 @@ for Python's `arcgis.apps.expbuilder.WebExperience` exposes an app's `datasource
 work at the level of the item. Neither one reads a widget's sublayer id or compares it with the
 layers that the service publishes. That comparison is this tool.
 
+For a dashboard, the editor shows "Cannot access data" on a widget when you open it, one dashboard
+at a time, in a browser. A GitHub repository search on 2026-10-13 found no tool that reads a
+dashboard's JSON and checks it against the fields of its layers. That search does not prove that
+none exists.
+
 ```
 $ python deadwidget.py --self-test
 deadwidget self-test: synthetic configs, one loopback portal, no credentials
@@ -33,7 +44,7 @@ PASS  the clean fixture resolves every reference and exits 0
 PASS  and it checked all 33 references, not zero
 PASS  it read the six services a reference needed
 PASS  and the one web map the app names
-PASS  a republish that gives id 15 to another layer still reads ok: the tool checks that an id exists, not what it names (Limits)
+PASS  with no name recorded anywhere, a republish that gives id 15 to another layer still reads ok: nothing says what it named (Limits)
 PASS  sublayer 15 is published, so layer-25-15 resolves
 PASS  and layer-25-1 is DANGLING although it is a prefix of layer-25-15  <-- pinned defect
 PASS  and the reverse: layer-25-15 is not found inside a published layer-25-1  <-- pinned defect
@@ -41,102 +52,30 @@ PASS  a deleted layer X-layer-215 is not sublayer 5 of X-layer-2: the dash is pa
 PASS  dataSource_10-... is not a child of dataSource_1  <-- pinned defect
 PASS  when two map service ids both prefix a reference, the longer one owns it
 PASS  a sublayer id that is not a number is DANGLING even when the service could not be asked
-PASS  when two declared ids both prefix a reference, the longer one owns it
-PASS  a sublayer id that is not a number is DANGLING
 ...
-PASS  a nested sublayer resolves as <layer>-<group>-<sublayer> and as <layer>-<sublayer>  <-- pinned defect
-...
-PASS  an app bound to a nested sublayer by its chain exits 0 after reading the service, not 1 unread  <-- pinned defect
-...
-PASS  a map service layer with no layers array resolves sublayer 2 from the service  <-- pinned defect
-PASS  and a nested service sublayer resolves by its own id, <layer>-<sublayer>
-PASS  and it is DANGLING once a republish drops sublayer 2 from the service
-PASS  a service that could not be read leaves its sublayers UNJUDGED, never ok  <-- pinned defect
-PASS  and the run exits 2, because unread is not clean  <-- pinned defect
-...
-PASS  a sublayer the layer item's scale-range array omits is DANGLING, although the web map has no layers array and the service publishes it  <-- pinned defect
-...
-PASS  a layer item that cannot be read leaves the sublayer UNJUDGED and the run exits 2, never 0  <-- pinned defect
-...
-PASS  a child of a subtype group layer is NOT AUDITED, not DANGLING  <-- pinned defect
-PASS  a child of a feature collection is NOT AUDITED, not DANGLING  <-- pinned defect
-PASS  a child of a knowledge graph layer is NOT AUDITED, not DANGLING  <-- pinned defect
-...
-PASS  a one-word suffix under a WEB_MAP main is a layer, not a data view, so it is judged  <-- pinned defect
-...
-PASS  a dangling reference in a top-level array is DANGLING, not inert  <-- pinned defect
-...
-PASS  a stale Map Layers or Swipe block the builder left behind is one INERT note each and exits 0, not N DANGLING and 1  <-- pinned defect
-...
-PASS  a dangling reference beside layersConfig in a MAP-mode table's config is DANGLING, exit 1, not INERT  <-- pinned defect
-...
-PASS  config/config.json is named the builder draft and the item data the published copy  <-- pinned defect
-PASS  a reference that is not audited makes the run incomplete, exit 2, even beside a dangling one  <-- pinned defect
-...
-PASS  a web scene app bound to a layer nobody checked exits 2, never 0 with a clean verdict  <-- pinned defect
-...
-PASS  the counts line names each status with its own count  <-- pinned defect
-...
-PASS  an INERT reference is not called resolved  <-- pinned defect
-...
-PASS  a label outside ASCII is printed escaped, so a cp1252 stdout cannot crash the report  <-- pinned defect
-PASS  a label's control characters are printed escaped, so it cannot drive the terminal or forge a VERDICT line  <-- pinned defect
-PASS  a crash nobody foresaw exits 2, never 1, and is redacted  <-- pinned defect
-PASS  output cut off by | head exits 2, not 1 or 120  <-- pinned defect
-PASS  and so does 2>&1 | head, where stderr is the same dead pipe  <-- pinned defect
-PASS  with no stdout or stderr at all, as under pythonw, each exit code stands and none becomes a traceback's 1, and no error line strays into stdout  <-- pinned defect
-...
-PASS  --out without --apply writes nothing at all  <-- pinned defect
-...
-PASS  --out naming the app, the draft, a web map, a service or a layer item file, however it is spelled, is refused and the input is kept  <-- pinned defect
-...
-PASS  a file and a portal together are a usage error  <-- pinned defect
-...
-PASS  online: a plain http url on the portal host or a trusted host is read without the token, and an https one with it  <-- pinned defect
-...
-PASS  online: and no request at all goes to a host that only web map data names  <-- pinned defect
-...
-PASS  online: the token never reaches stdout or stderr  <-- pinned defect
-...
-PASS  online: a portal error that echoes the token is printed redacted  <-- pinned defect
-...
-PASS  and urllib's error, which quotes the whole url, is redacted  <-- pinned defect
-PASS  and so is one whose token holds a space
-PASS  and the token's + for a space is redacted too  <-- pinned defect
-PASS  a local file url is unread
-PASS  and it is refused before any request is made  <-- pinned defect
-PASS  a network share url is unread
-PASS  and it is refused before any request is made  <-- pinned defect
-...
-PASS  and it is refused before any request is made  <-- pinned defect
-...
-PASS  and it is refused before any request is made  <-- pinned defect
-PASS  a redirect to an ftp url is unread
-PASS  and the ftp url is never opened  <-- pinned defect
-...
-PASS  a redirect to another http url is still followed
-PASS  online: a redirect never carries the token to a host that may not have it  <-- pinned defect
-PASS  online: and it follows one to a trusted host
-PASS  online: and a read with no token follows the redirect
-PASS  online: a web map layer with a file: url leaves its sublayers UNJUDGED and fetches nothing  <-- pinned defect
+PASS  online: a layer item that cannot be read is UNJUDGED
+PASS  online: a layer item with no service url is UNJUDGED
+PASS  online: a web map layer with no url, and an id that is not an item id, are UNJUDGED and never fetched
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-284 assertions, 0 failed
+429 assertions, 0 failed
 ```
 
-The full run prints all 284 assertions. The `...` lines above are where this block is cut.
+The full run prints all 429 assertions. The `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 284 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
-with `-W error`, and the three runs print identical output.
-Branch coverage of `deadwidget.py` under `--self-test` is 100 percent, with no line excluded.
+The same 429 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
+with `-W error`, and the three runs print identical output. Branch coverage of `deadwidget.py`
+under `--self-test` is 100 percent, measured on Windows with Python 3.13.2 and `coverage run
+--branch`, with no line excluded. `pyflakes` reports nothing on Windows. The Ubuntu host has
+neither `coverage` nor `pyflakes`.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -152,6 +91,8 @@ python deadwidget.py --self-test
 python deadwidget.py app.json --webmap webmap.json --service URL=service.json
 python deadwidget.py app.json --resource config.json --webmap ITEMID=webmap.json --service URL=service.json
 python deadwidget.py app.json --webmap webmap.json --service URL=service.json --layer-item ITEMID=item.json
+python deadwidget.py app.json --webmap webmap.json --service URL=after.json --before URL=before.json
+python deadwidget.py dash.json --dashboard --dash-layer ITEMID/LAYERID=layer.json
 python deadwidget.py app.json --webmap webmap.json --out report.json --apply
 ```
 
@@ -164,27 +105,36 @@ The files come from these REST addresses:
 | `--webmap` | `<portal>/sharing/rest/content/items/<web map item id>/data?f=json` |
 | `--service` | `<MapServer or FeatureServer url>?f=json` |
 | `--layer-item` | `<portal>/sharing/rest/content/items/<Map Image Layer item id>/data?f=json` |
+| `--before` | The same address as `--service`, saved before the republish |
+| `APP_JSON` with `--dashboard` | `<portal>/sharing/rest/content/items/<dashboard item id>/data?f=json` |
+| `--dash-layer` | `<layer url>?f=json`, for the layer a dataset names |
+| `--dash-service` | `<service url>?f=json` of a layer item's service |
 
 Online, the tool reads all of these itself:
 
 ```
 set DEADWIDGET_TOKEN=<token>
 python deadwidget.py --portal https://org.maps.arcgis.com --item <app item id>
+python deadwidget.py --dashboard --portal https://org.maps.arcgis.com --item <dashboard item id>
 ```
 
 | Flag | Default | What it does |
 |---|---|---|
-| `APP_JSON` | none | The app's item `/data`, saved as JSON. This is the published copy that users get. Offline mode. |
+| `APP_JSON` | none | The app's item `/data`, saved as JSON. This is the published copy that users get. Offline mode. With `--dashboard`, the dashboard's `/data`. |
 | `--resource` | none | The app's `config/config.json` resource, which is the builder's draft. It is audited too, and compared with `APP_JSON`. |
 | `--webmap` | none | A web map's `/data` as `[ITEMID=]FILE`. Repeatable. The item id can be left out when the app names one web map. |
 | `--service` | none | A service description as `URL=FILE`. Repeatable. The tool names each url it needs. |
 | `--layer-item` | none | A Map Image Layer item's `/data` as `ITEMID=FILE`, for a web map layer added from that item. Repeatable. The tool names each item it needs. |
+| `--before` | none | A service description as `URL=FILE`, saved before a republish. A layer whose name moved to another id is `RENUMBERED`. Repeatable. A url that no reference needs exits 2. |
+| `--dashboard` | off | The input is an ArcGIS Dashboards item's `/data`, not an Experience Builder app. See Dashboards. |
+| `--dash-layer` | none | With `--dashboard`, offline: a layer description as `ITEMID/LAYERID=FILE`, for the layer a dataset names. Repeatable. |
+| `--dash-service` | none | With `--dashboard`, offline: a layer item's service description as `ITEMID=FILE`, to tell a removed layer from an unread one. Repeatable. |
 | `--portal` | none | Portal url. Online mode. Must start with `https://` or `http://`. |
 | `--item` | none | The app's item id, 32 hexadecimal characters. Online mode. |
 | `--token` | none | A portal token. The `DEADWIDGET_TOKEN` environment variable is the better place for it. |
 | `--trust-host` | none | Another host that the tool can read services from and send the token to, such as a federated server. Repeatable. |
 | `--out` | none | Path for a JSON report. A path that names one of the input files is refused, exit 64, and the input is kept. |
-| `--apply` | off | Write `--out`. Without it nothing is written. |
+| `--apply` | off | Write `--out`. Without it nothing is written. Every option is spelled in full: an abbreviation such as `--ap` is a usage error, exit 64, and writes nothing. |
 | `--self-test` | off | Run the assertions and exit. |
 
 The tool is read-only. `--apply` writes the report file and nothing else. No flag changes the
@@ -217,8 +167,11 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 
 | Status | Meaning | Fails the run |
 |---|---|---|
-| `OK` | The id resolves to a layer that exists. | no |
+| `OK` | The id resolves to a layer that exists. When no recorded name was there to compare, a `NOTE` line says so. | no |
 | `DANGLING` | The data source is not declared, the web map has no such layer, a `layers` array that decides the sublayers, in the web map or in the layer's item, omits the sublayer, or the service no longer publishes it. Limits says when the array decides. | exit 1 |
+| `RENUMBERED` | The id exists, but a recorded name shows it now names another layer: the web map entry's name, or the `--before` description, is published under a different id. | exit 1 |
+| `DRIFTED` | The id exists and its recorded name changed, and no layer the service publishes carries the old name. A rename and a renumber look the same, so the run cannot call it clean. | exit 2 |
+| `WARN` | The id resolves, but the web map hides the sublayer (`visibleLayers`) or omits it from a `layers` array that does not decide the sublayers. Advisory. | no |
 | `UNJUDGED` | The web map, the service or the layer item needed to decide could not be read. | exit 2 |
 | `INERT` | Dangling, but in an entry that no widget reads. There are two such places. The first is the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. The second is a Swipe or Map Layers block kept for a map view that no longer exists (see below). The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
 | `NOT AUDITED` | A child of a web scene, a widget output, a subtype group layer, a knowledge graph layer, a feature collection, or another type this tool does not model. Nothing checked it, so it is not clean. | exit 2 |
@@ -229,8 +182,8 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
    service holds, unless the layer's item decides them (see Limits). A check that reads only the
    web map finds no sublayers there, and reports every widget bound to one as dangling. This tool
    reads the service.
-2. `layer-25-1` is a substring of `layer-25-15`. A substring test found sixteen defects on one
-   real app that did not exist. This tool compares whole ids, and every prefix match stops at a
+2. `layer-25-1` is a substring of `layer-25-15`. A substring test reported defects
+   that did not exist. This tool compares whole ids, and every prefix match stops at a
    dash.
 
 **Map views that are left behind.** The Swipe widget keys `swipeMapViewList`, and the Map Layers
@@ -240,6 +193,103 @@ web map, the builder keeps the block for the old map view. The widget reads only
 view that exists. So the tool judges the entries of a block whose map view is a data source that
 the map widget uses. A block for any other map view is one `INERT` note at most, and the tool does
 not judge its entries. The self-test pins both cases.
+
+**Renumbers and name drift.** An id alone cannot show a renumber. After a republish inserts a
+layer, the old id can still exist and name another layer. A recorded name can show it. The tool
+reads one from the web map's sublayer entry, whose `name` is "The name of the layer" in the web
+map specification (Esri, layer object). It reads another from the service description that you
+pass with `--before`, where each layer has an `id` and a `name` (Esri, map service resource). A
+web map entry can also draw another service layer than its own id: its `layerDefinition.source` of
+type `mapLayer` carries a `mapLayerId`, "The current map layer's id" (Esri, dynamicMapLayer
+source). The widget then reads the layer that `mapLayerId` names.
+
+| Case | Status |
+|---|---|
+| The recorded name is published under another id, and the bound id now has a different name | `RENUMBERED`, exit 1 |
+| A web map entry carries the name of service layer A but draws layer B | `RENUMBERED`, exit 1 |
+| A web map entry draws a service layer that the service no longer publishes | `DANGLING`, exit 1 |
+| The bound id has a different name, and no layer carries the old name | `DRIFTED`, exit 2 |
+| No name was recorded for the layer | `OK`, with a `NOTE` that it was checked by id only |
+
+This run reads a synthetic app. The service was republished with a new layer `Parcels` at id 15,
+which moved `Zoning 15` to id 16. The web map records no sublayer names, so `--before` supplies
+the old ones. The "Hydrants near me" widget is bound to a sublayer that the web map's
+`visibleLayers` leaves out.
+
+```
+$ python deadwidget.py app.json --webmap webmap.json --service https://gis.example.com/server/rest/services/Planning/Zoning/MapServer=after.json --service https://gis.example.com/server/rest/services/Utilities/Water/MapServer=water.json --before https://gis.example.com/server/rest/services/Planning/Zoning/MapServer=before.json
+deadwidget: published copy, 2 widget(s), 6 data source reference(s)
+web maps read: 1 of 1, services read: 2 of 2
+
+RENUMBERED   dataSource_1-18f00000001-layer-25-15
+             widget_1 (Zoning lookup), in the published copy
+             sublayer 15 of 'Zoning': the service before the republish (--before) calls it 'Zoning 15', and the service now publishes 'Zoning 15' as layer 16. Layer 15 is now 'Parcels', so the widget reads the wrong layer
+             at widgets.widget_1.useDataSources[0].dataSourceId (and 1 more path(s))
+
+WARN         dataSource_1-18f00000002-layer-3-2
+             widget_2 (Hydrants near me), in the published copy
+             sublayer 2 of 'Water': the web map's visibleLayers for this service omits it, so it is hidden when the map loads, and a widget that queries only visible sublayers sends no request for it
+             at widgets.widget_2.useDataSources[0].dataSourceId (and 1 more path(s))
+
+references: 6 found, 2 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 2 renumbered, 0 drifted, 2 warn
+VERDICT: 1 widget binding(s) point at a layer id that now names another layer: see RENUMBERED.
+(exit 1)
+```
+
+Without `--before` the same files print no `RENUMBERED` finding. The run reads the Zoning widget
+as `OK`, prints a `NOTE` that two references were checked by id only, and exits 0 because only the
+`WARN` remains:
+
+```
+$ same command without --before
+deadwidget: published copy, 2 widget(s), 6 data source reference(s)
+web maps read: 1 of 1, services read: 2 of 2
+
+WARN         dataSource_1-18f00000002-layer-3-2
+             widget_2 (Hydrants near me), in the published copy
+             sublayer 2 of 'Water': the web map's visibleLayers for this service omits it, so it is hidden when the map loads, and a widget that queries only visible sublayers sends no request for it
+             at widgets.widget_2.useDataSources[0].dataSourceId (and 1 more path(s))
+
+NOTE         2 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
+
+references: 6 found, 4 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 2 warn
+VERDICT: every data source reference resolves. 1 widget binding(s) read a sublayer that the web map hides or omits: see WARN.
+(exit 0)
+```
+
+When the old name is published nowhere, as when the republish also dropped `Zoning 15`, the same
+`--before` run prints `DRIFTED` and exits 2:
+
+```
+$ same command with gone.json as the Zoning service
+deadwidget: published copy, 2 widget(s), 6 data source reference(s)
+web maps read: 1 of 1, services read: 2 of 2
+
+DRIFTED      dataSource_1-18f00000001-layer-25-15
+             widget_1 (Zoning lookup), in the published copy
+             sublayer 15 of 'Zoning': the service before the republish (--before) calls it 'Zoning 15' and the service calls it 'Parcels'. A rename or a renumber: no layer the service publishes carries the old name
+             at widgets.widget_1.useDataSources[0].dataSourceId (and 1 more path(s))
+
+WARN         dataSource_1-18f00000002-layer-3-2
+             widget_2 (Hydrants near me), in the published copy
+             sublayer 2 of 'Water': the web map's visibleLayers for this service omits it, so it is hidden when the map loads, and a widget that queries only visible sublayers sends no request for it
+             at widgets.widget_2.useDataSources[0].dataSourceId (and 1 more path(s))
+
+references: 6 found, 2 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 0 renumbered, 2 drifted, 2 warn
+VERDICT: INCOMPLETE. 2 reference(s) resolve to a layer whose name changed, and nothing shows whether that is a rename or a renumber: see DRIFTED.
+(exit 2)
+```
+
+**A sublayer that the web map hides.** In a web map, a map service layer's `visibleLayers` is "An
+array of sublayer ids that should appear visible" (Esri, mapServiceLayer). The tool reports a
+`WARN` for a bound top-level sublayer that a present `visibleLayers` array leaves out, and for one
+that a `layers` array leaves out when that array does not decide the sublayers. A present but empty
+`visibleLayers` hides every sublayer. An absent one leaves visibility to the service, so it is not
+a `WARN`. The warning is advisory because only some widgets depend on visibility. The author
+found that a Near Me widget sent no request for a category whose sublayer was hidden. The `layers` case is advisory because the ArcGIS Maps SDK for
+JavaScript trusts such an array only when an entry sets a scale range (see Limits), and one
+observation of a running app found a sublayer missing without one. A nested sublayer is not
+judged. A `WARN` on a reference that no widget reads is dropped.
 
 **The two copies of the configuration.** An Experience Builder app stores its configuration
 twice. The item `/data` is the published copy, and users get it. The `config/config.json` resource
@@ -298,13 +348,76 @@ The same app in online mode, with the same files served by Python's `http.server
 loopback address, printed the same findings, with the loopback urls, and exited 1. The token went
 to all five requests and appeared in neither the output nor the report file.
 
+## Dashboards
+
+With `--dashboard` the input is an ArcGIS Dashboards item's `/data`. Esri publishes no schema for
+that JSON. The keys the tool reads were measured on exports, and they are listed in the code:
+`datasets[].dataSource`, `groupByFields`, `orderByFields`, `statisticDefinitions`, `outFields`,
+the filter rules, a serial chart's `category`, `splitBy` and `graphs`, a table's
+`dataSettings.valueFields`, and `events[].actions[].targets[]`. A shape the tool does not model is
+not checked (see Limits). A dataset names a layer by item id and layer id. A number is a layer of a
+layer item, and any other id is a layer of a web map, which `--webmap` supplies offline.
+
+| Rule | Level | Finds |
+|---|---|---|
+| `field-gone` | BROKEN | A group-by field, statistic field, output field, sort field, filter field or field-map side that the layer, or the query, does not have. |
+| `filter-type` | BROKEN | A filter rule typed as one kind of field where the layer field is another. |
+| `series-unbound` | BROKEN | A serial chart series bound to a field that its query does not return, or a features chart over a query that groups. |
+| `column-unreturned` | BROKEN | A table column that its query does not return. |
+| `stat-unshown` | WARN | A grouped table query that returns a statistic no column shows. |
+| `arcade-gone` | BROKEN | A dataset that reads an Arcade data source the dashboard does not define. |
+| `layer-gone` | BROKEN | A layer that its item, or its web map, no longer publishes. |
+| `target-gone` | BROKEN | An action that targets a widget, or a map layer, that the view does not have. |
+| `target-dataset-gone` | BROKEN | An action that targets a dataset name its widget does not have. |
+| `cross-no-fieldmap` | BROKEN | A filter between two data sources that maps no fields. |
+| `fieldmap-many` | WARN | A field map with several pairs. |
+| `selection-and` | WARN | A widget that requires a selection from several sources, not all of them selectors. |
+
+A query with statistics returns only its group-by fields and its statistics' output names, which
+is how the REST query operation answers `outStatistics` with `groupByFieldsForStatistics`.
+`cross-no-fieldmap` follows Esri: when a filter's source and target use different data sources,
+you must set up a relationship between them, by attribute or by geometry (Esri, Dashboards
+actions). The tool judges only the attribute (`whereClause`) form, and a filter with no field map
+matches nothing. `fieldmap-many` is a `WARN` because the author's dashboards applied only the
+first pair. Esri does not document that. A layer that cannot be read is `UNJUDGED`, and a layer of
+a kind the tool does not model, such as a subtype group layer or a map image layer, is `NOT
+AUDITED`. Both exit 2. A dashboard with no widget that the tool recognises, meaning an object with
+a string `id` and a `type` that ends in `Widget`, checked nothing, so it exits 2.
+
+This run reads a synthetic dashboard whose chart groups by a field that the layer lacks, and whose
+table asks for a column the layer lacks:
+
+```
+$ python deadwidget.py dash.json --dashboard --dash-layer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0=orders.json
+deadwidget: dashboard, 2 widget(s), 2 dataset(s), 0 action target(s)
+web maps read: 0 of 0, layers read: 1 of 1
+
+BROKEN       field-gone
+             'Orders by crew' (serialChartWidget), desktop view
+             it groups by 'crew_name', which the layer does not have
+             at desktopView.widgets[0].datasets[0]
+
+BROKEN       field-gone
+             'Open orders' (tableWidget), desktop view
+             it asks for field 'cost', which the layer does not have
+             at desktopView.widgets[1].datasets[0]
+
+findings: 2 broken, 0 unjudged, 0 not audited, 0 warn
+VERDICT: 2 finding(s) bind a widget to data it cannot read.
+(exit 1)
+```
+
+The online path, `--dashboard --portal ... --item ...`, reads the dashboard, its web maps, its
+layer items and their services over REST. The self-test serves those from a loopback
+`http.server` and asserts the same findings.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | Every reference resolves in every copy the run audited. That is the published copy, and also the draft when `--resource` is given or the run is online. The copies can still diverge, which is reported. |
-| 1 | A reference is dangling in the published copy or in the draft. |
-| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does, with or without `2>&1`. |
+| 0 | Every reference resolves in every copy the run audited. That is the published copy, and also the draft when `--resource` is given or the run is online. The copies can still diverge, and a `WARN` or an id-only `NOTE` can remain. Both are reported. For a dashboard: no `BROKEN` finding. |
+| 1 | A reference is dangling or `RENUMBERED` in the published copy or in the draft. For a dashboard: a `BROKEN` finding. |
+| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer, or `DRIFTED`. A `--before` url that no reference needed. An app with no widget and no reference, or a dashboard with no recognised widget. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does, with or without `2>&1`. |
 | 64 | Usage error. |
 
 Exit 2 beats exit 1. A web map that could not be read is not a web map known to be clean, and a
@@ -335,6 +448,9 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   use.
 - The token is never sent over plain `http`, except to the loopback address. A plain `http`
   portal together with a token is refused before any request.
+- A usage error never echoes an argument that argparse did not recognise: a mistyped
+  `--tok SECRET` prints `--tok ***`. The self-test pins this for `--tok`, `--tokens=`, `-t` and
+  the environment token.
 - Every line the tool prints and the report file are redacted. The token is removed raw and in
   both url forms, where a space is `+` or `%20`. The self-test serves a portal error that echoes
   the token back, and asserts that the token reaches neither.
@@ -354,9 +470,9 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 
 - The group layer rule, `<group id>-<layer id>`, comes from Esri's documented composition rule. It
   was not measured on a real app, because the author's apps bind no widget to a group layer's
-  child. A nested map service sublayer was measured in two forms. Four references on one real app
-  used the flat `<layer id>-<sublayer id>` form. The saved configuration of another app used the
-  chain `<layer id>-<group sublayer id>-<sublayer id>`. The tool accepts both. It reads the
+  child. A nested map service sublayer was measured in two forms. A real app used the flat
+  `<layer id>-<sublayer id>` form. The saved configuration of another app used the chain
+  `<layer id>-<group sublayer id>-<sublayer id>`. The tool accepts both. It reads the
   chain from the service's `parentLayerId` values, from the top-level group down.
 - A web map `layers` array decides a map service's sublayers only when one of its entries carries
   a `minScale`, directly or in its `layerDefinition`. The ArcGIS Maps SDK for JavaScript then builds
@@ -373,11 +489,11 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 - A table in `MAP` mode builds its tabs from the layers in the map. It applies a `layersConfig`
   entry only to the layer whose data source id the entry names. This comes from reading the Table
   widget's shipped code, and it was not measured in a running app. What was measured is only that
-  five of the author's apps use `MAP` mode. So a dangling entry there makes no tab, and it is
+  the author's apps use `MAP` mode. So a dangling entry there makes no tab, and it is
   reported as `INERT`, with exit 0.
 - An `INERT` entry can still cost something. When a republish renumbers a sublayer, the new
   sublayer gets a tab, but that tab has lost the entry's search fields, columns and CSV export.
-  The tool cannot tell a renumber from a removal. For that reason, a run with an `INERT` reference
+  Without a recorded name the tool cannot tell a renumber from a removal. For that reason, a run with an `INERT` reference
   never prints "every data source reference resolves". The counts line always gives the `INERT`
   count. The verdict gives it too when nothing else fails the run; otherwise the verdict names
   only what failed the run.
@@ -392,14 +508,17 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   escapes, so that a Windows job that redirects the output to a file cannot fail halfway through
   the report. A control character, such as a line break or an escape, is printed as `\x0a` or
   `\x1b`. So a label cannot drive the terminal or add a false `VERDICT` line to a job's log.
-- It checks that each layer id exists. It does not check which layer the id now names. A
-  republish that inserts or removes a sublayer often shifts the ids, so an old id can still exist
-  and name a different layer. Such a binding reads `OK`, and the run can exit 0 with "every data
-  source reference resolves". The widget then reads the wrong layer. The self-test pins this limit:
-  sublayer 15 renamed from a zoning layer to "Parcels" still reads `OK`. Compare the service's
-  layer names with what each widget should show after any republish that changes the layer list.
-- It does not check the field names a widget uses. A renamed field is another silent failure, and
-  it is not this one.
+- A renumber shows only when a name was recorded. The check needs the web map entry's `name`
+  (Map Viewer writes titles, not names) or a `--before` description. Without either, the tool
+  checks that the id exists, prints a `NOTE`, and a shifted id reads `OK`. The renumber check for a
+  web map feature layer works only with `--before`, because the web map records no service layer
+  name for it. The `VERDICT` line of such a run stays clean, so read the `NOTE`. A layer with no
+  name in the current service reads `OK`. A `--before` file that does
+  not list the bound id compares nothing, and the `NOTE` says so.
+- A `DRIFTED` binding exits 2 on every run, because the tool cannot tell a rename from a renumber.
+  Fix the binding or re-save the web map so that it records the new name.
+- The tool does not check the field names a widget uses in an Experience Builder app. `--dashboard`
+  checks fields in a dashboard.
 - `childDataSourceJsons` entries are overrides for a layer. They are not references, so a stale
   override is not reported.
 - It audits one app per run. It does not sweep an organization.
@@ -407,6 +526,54 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   The only use of another widget is the map view rule above: a Swipe or Map Layers block counts
   as current when its map view is `<widget id>-<data source id>` for a data source that some
   widget in the app uses.
+- Only ASCII-safe UTF-8 (with or without BOM) JSON is read. A UTF-16 file, as PowerShell 5
+  redirection writes, is reported unread and exits 2, not decoded.
+- A name comparison ignores case and surrounding whitespace. It does not normalise Unicode, so the
+  same layer name in NFC and NFD forms is reported `DRIFTED`, not `OK`.
+- Offline, a dashboard layer read from a layer item has no url identity. A filter between that
+  layer and the same service layer reached through a web map can read as "another data source"
+  (`cross-no-fieldmap`), where online mode sees the same layer.
+- A dashboard or app of the wrong types, for example `datasets` as a number or an object, or
+  `statisticDefinitions` as a number, is not modelled. It exits 2 with "could not complete", never 0
+  or 1.
+- Esri publishes no schema for Dashboards JSON, and the keys were measured on exports. A chart
+  reads only the object form `{"category": {"fieldName": ...}}`. A chart whose `category` or
+  `splitBy` is a plain string, or any other shape the tool does not model, is skipped without a
+  message, and the run can print "every widget reads data its layer returns". An unmodelled shape
+  is not checked.
+- A `--webmap` or other file argument written as `name=path`, with a leading alphanumeric word
+  before the `=`, is read as `ITEMID=FILE`. The real web map then stays unread, and the run exits
+  2.
+- A service url is matched exactly after the query string is dropped. A different host or scheme
+  case, such as `mapserver` against `MapServer`, between the web map and `--service` leaves the layer
+  `UNJUDGED`, and the run exits 2.
+- The redaction of the report file matches the token text as printed. A token with a character
+  that JSON escapes (a quote, a backslash or a non-ASCII character) would not match inside the
+  JSON report if a portal echoed it. Standard output is redacted correctly. Real ArcGIS tokens are
+  URL-safe.
+- The status line prints `web maps read: 0 of 0` for a dashboard that names no web map. That is
+  noise, not a failure.
+- A redirect from an accepted host is followed to any `http` or `https` host when the run sends no
+  token, which is the case for a `--trust-host` host read over plain `http` and for a run with no
+  token. The answer is parsed and never printed, but the request is still a blind GET that a
+  server's response drives.
+- Very deep JSON nesting can exhaust the recursion limit. The run then exits 2 with "could not
+  complete".
+- A symbolic or hard link given as `--out`, or an input reached through a different link, can
+  evade the check that `--out` is not an input when `--out` does not yet exist. `--apply` then
+  writes through the link.
+- `--token` on the command line is visible to other local processes, to shell history and to task
+  logs. Use `DEADWIDGET_TOKEN`. A run with no token at all raises no warning.
+- `HTTP_TIMEOUT` applies to each socket operation, not to the whole request. The body size limit
+  bounds the total bytes.
+- A web map or `--portal` url that carries credentials, such as `https://user:pass@host/portal`,
+  is printed in the "could not be read" lines and written to the report's `source`. Such a url
+  cannot authenticate, because `urllib` ignores the credentials.
+- The visibility `WARN` judges a top-level sublayer only. It rests on the web map specification's
+  description of `visibleLayers` and on one observation of a running app. It was not read from the
+  SDK.
+- The README's claims about `@arcgis/core` `sublayerUtils.js` and `SublayersOwner.js` are read from
+  the SDK's code, not measured in a running app.
 - It changes nothing. Re-binding a widget is done in the builder, or with the two-copy write that
   the app then needs.
 
@@ -430,6 +597,11 @@ MIT.
 - Esri, [JimuMapView](https://developers.arcgis.com/experience-builder/api-reference/jimu-arcgis/JimuMapView/): `getDataSourceIdByAPILayer`, one data source id per layer or sublayer.
 - teeks822828, [exb-publish-agol](https://github.com/teeks822828/exb-publish-agol) (MIT): a feature service data source keys its `childDataSourceJsons` by layer index, `0` and `1`.
 - Esri Community, [Change Data Source without have to re-create everything in the ExB app](https://community.esri.com/t5/arcgis-experience-builder-ideas/change-data-source-without-have-to-re-create/idc-p/1622393): a web map data source's `childDataSourceJsons` holds its layers.
+- Esri, [Web map specification, layer](https://developers.arcgis.com/web-map-specification/objects/layer/): a layer's `name` is "The name of the layer".
+- Esri, [Web map specification, mapServiceLayer](https://developers.arcgis.com/web-map-specification/objects/mapServiceLayer/): `visibleLayers` is "An array of sublayer ids that should appear visible".
+- Esri, [Web map specification, dynamicMapLayer source](https://developers.arcgis.com/web-map-specification/objects/dynamicMapLayer_source/): `mapLayerId` is "The current map layer's id".
+- Esri, [Map service resource](https://developers.arcgis.com/rest/services-reference/enterprise/map-service/): `layers[]` carry `id`, `name` and `parentLayerId`, and `tables[]` carry `id` and `name`.
+- Esri, [Dashboards actions](https://doc.arcgis.com/en/dashboards/latest/create-and-share/actions.htm): a source and a target on different data sources need a relationship, by attribute or by geometry.
 - Esri, [solution.js issue 660](https://github.com/Esri/solution.js/issues/660): `config/config.json` holds the builder's draft, and publishing pushes the changes to the item data.
 - Esri, [Working with Web Experiences in the Python API](https://developers.arcgis.com/python/latest/guide/experience-builder-workflows/): the `datasources` property and `upload(auto_remap=True)`.
 
