@@ -162,13 +162,22 @@ DRIFTED = "DRIFTED"
 # The id exists, but the web map hides or omits the sublayer, so a widget that
 # queries only visible sublayers sends no request for it. Advisory.
 WARN = "WARN"
+# The id exists, and a filter is bound to it, but the layer's scale range
+# hides it at the scale the app opens at. The filter changes nothing a user
+# can see. Advisory.
+HIDDEN = "OUT OF SCALE"
 
 # The reason of an OK verdict reached by id alone, with no name to compare.
 ID_ONLY = "id only"
 
 # Print order, worst first.
 RANK = {DANGLING: 0, RENUMBERED: 1, UNJUDGED: 2, NOT_AUDITED: 3, DRIFTED: 4,
-        WARN: 5, INERT: 6, OK: 7}
+        WARN: 5, HIDDEN: 6, INERT: 7, OK: 8}
+
+# Where a Filter widget keeps the data source of one filter. Esri documents
+# no saved key names for the widget, so this is a convention to check against
+# your own app (README, Limits).
+FILTER_REF = re.compile(r"\.filterItems\[\d+\]\.dataSource\.dataSourceId$")
 
 # The only url schemes fetched. urllib also opens file: and ftp: urls, and a
 # file: url with a host is an SMB connection on Windows. Service urls come
@@ -196,6 +205,8 @@ class Ref(object):
         # Why no widget reads this entry, or "". A DANGLING verdict on an
         # inert reference is reported as INERT with this reason.
         self.inert = inert
+        # True for the data source of a Filter widget's filter.
+        self.filtered = bool(FILTER_REF.search(path))
 
 
 class Verdict(object):
@@ -217,6 +228,13 @@ class Published(frozenset):
 
 
 # ---------------------------------------------------------- decision core
+
+class WebMapIndex(tuple):
+    """index_webmap's (entries, mapsvc). scale is the scale of the web map's
+    initial viewpoint, or 0 when it records none."""
+
+    scale = 0
+
 
 def payload_error(doc):
     """The message of an ArcGIS error body, or None.
@@ -363,6 +381,32 @@ def sublayer_names(layer):
     return out
 
 
+def scale_value(value):
+    """value as a scale denominator, or 0 when it is none: a web map writes
+    0 for no limit, and anything that is not a positive number is no limit."""
+    return value if isinstance(value, (int, float)) and not isinstance(
+        value, bool) and 0 < value < float("inf") else 0
+
+
+def scale_range(layer):
+    """(minScale, maxScale) of a web map layer or sublayer entry, 0 for none.
+    The value on the entry wins over the one in its layerDefinition."""
+    ldef = layer.get("layerDefinition")
+    ldef = ldef if isinstance(ldef, dict) else {}
+    return tuple(scale_value(layer.get(key)) or scale_value(ldef.get(key))
+                 for key in ("minScale", "maxScale"))
+
+
+def sublayer_ranges(layer):
+    """{sublayer id: (minScale, maxScale)} from a layers array."""
+    out = {}
+    subs = layer.get("layers")
+    for sub in subs if isinstance(subs, list) else []:
+        if isinstance(sub, dict) and sub.get("id") is not None:
+            out["%s" % (sub["id"],)] = scale_range(sub)
+    return out
+
+
 def same_name(a, b):
     return a.strip().lower() == b.strip().lower()
 
@@ -470,7 +514,7 @@ def index_webmap(doc):
         if isinstance(layer.get("featureCollection"), dict):
             opaque = "feature collection"
         entries[suffix] = {"kind": kind, "title": title, "check": None,
-                           "opaque": opaque}
+                           "opaque": opaque, "range": scale_range(layer)}
         if ltype == "GroupLayer":
             children = layer.get("layers")
             for child in children if isinstance(children, list) else []:
@@ -482,7 +526,9 @@ def index_webmap(doc):
                 and ITEM_ID.match(item) else None
             mapsvc[suffix] = {"title": title, "url": root, "listed": listed,
                               "item": item, "named": sublayer_names(layer),
-                              "shown": _id_list(layer.get("visibleLayers"))}
+                              "shown": _id_list(layer.get("visibleLayers")),
+                              "range": scale_range(layer),
+                              "ranges": sublayer_ranges(layer)}
         elif index is not None:
             entries[suffix]["check"] = (root, index)
 
@@ -491,7 +537,12 @@ def index_webmap(doc):
     tables = doc.get("tables")
     for table in tables if isinstance(tables, list) else []:
         add(table, "", "table")
-    return entries, mapsvc
+    out = WebMapIndex((entries, mapsvc))
+    state = doc.get("initialState")
+    view = state.get("viewpoint") if isinstance(state, dict) else None
+    if isinstance(view, dict):
+        out.scale = scale_value(view.get("scale"))
+    return out
 
 
 def member(url, sid, services, what, hint=None):
@@ -511,6 +562,17 @@ def member(url, sid, services, what, hint=None):
                    % (what, url, sid))
 
 
+def map_service_of(child, mapsvc):
+    """The suffix of the map service layer that owns child, else None. The
+    longest wins, and the dash is part of the match."""
+    best = None
+    for lid in mapsvc:
+        if child.startswith(lid + "-") and (best is None
+                                            or len(lid) > len(best)):
+            best = lid
+    return best
+
+
 def judge_child(child, index, services):
     """Resolve the part of an id after the web map data source id."""
     entries, mapsvc = index
@@ -522,11 +584,7 @@ def judge_child(child, index, services):
         return Verdict(OK)
     # Whole ids at dash boundaries only. A substring test finds layer-25-1
     # inside layer-25-15 and reports a reference that exists as dangling.
-    best = None
-    for lid in mapsvc:
-        if child.startswith(lid + "-") and (best is None
-                                            or len(lid) > len(best)):
-            best = lid
+    best = map_service_of(child, mapsvc)
     if best is None:
         for lid in sorted(entries):
             entry = entries[lid]
@@ -593,6 +651,84 @@ def hidden(layer, leaf, what, ok):
                        "entry sets a scale range, but a running app was "
                        "seen to drop such a sublayer" % what)
     return ok
+
+
+def layer_ranges(child, index):
+    """[(what, minScale, maxScale)] for each scale range that can hide a web
+    map layer or sublayer, from the layer and from its own layers entry. A
+    range that sets no limit is left out. child resolved, so one of the two
+    owns it."""
+    entries, mapsvc = index
+    entry = entries.get(child)
+    if entry is not None:
+        found = [("layer '%s'" % entry["title"], entry["range"])]
+    else:
+        best = map_service_of(child, mapsvc)
+        layer = mapsvc[best]
+        sid = child[len(best) + 1:].split("-")[-1]
+        found = [("layer '%s'" % layer["title"], layer["range"]),
+                 ("sublayer %s of '%s'" % (sid, layer["title"]),
+                  layer["ranges"].get(sid, (0, 0)))]
+    return [(what, lo, hi) for what, (lo, hi) in found if lo or hi]
+
+
+def custom_view(app):
+    """True when a widget keeps a custom initial map view of its own, which
+    replaces the web map's. Esri documents the option in the builder, not the
+    keys it saves, so these are the names the builder's source uses."""
+    for widget in app["widgets"].values():
+        config = widget.get("config") if isinstance(widget, dict) else None
+        if isinstance(config, dict) and (config.get("isUseCustomMapState")
+                                         or config.get("initialMapState")):
+            return True
+    return False
+
+
+def app_scale(app, index, override):
+    """(scale, where it came from) for the app's first view; 0 when unknown.
+    --app-scale wins. A web map viewpoint that records only an extent gives
+    no scale: the scale then depends on the size of the window."""
+    if override:
+        return override, "--app-scale"
+    if custom_view(app):
+        return 0, ("a map widget sets its own initial view, which is not "
+                   "read")
+    if index.scale:
+        return index.scale, "the web map's initial viewpoint"
+    return 0, ("the web map's initial viewpoint records an extent or "
+               "nothing, and an extent gives a scale only for a known window "
+               "size")
+
+
+def scale_check(dsid, app, webmaps, override):
+    """For a filter's data source that resolved: HIDDEN when a scale range
+    hides the layer at the app's scale, UNJUDGED when a range is set and the
+    scale is not known, else None. Only a web map layer carries the range."""
+    datasources = app["dataSources"]
+    root, child = split_root(dsid, datasources)
+    if child is None or datasources[root].get("type") != "WEB_MAP":
+        return None
+    index = webmaps[datasources[root]["itemId"]]
+    ranges = layer_ranges(child, index)
+    if not ranges:
+        return None
+    scale, source = app_scale(app, index, override)
+    if not scale:
+        return Verdict(UNJUDGED, "%s sets a scale range, and the scale the "
+                       "app opens at is not known: %s. Give --app-scale"
+                       % (ranges[0][0], source))
+    for what, lo, hi in ranges:
+        if lo and scale > lo:
+            return Verdict(HIDDEN, "%s is not drawn at 1:%.0f (%s), because "
+                           "its minimum scale is 1:%.0f. A filter on it "
+                           "changes nothing a user can see until they zoom "
+                           "in" % (what, scale, source, lo))
+        if hi and scale < hi:
+            return Verdict(HIDDEN, "%s is not drawn at 1:%.0f (%s), because "
+                           "its maximum scale is 1:%.0f. A filter on it "
+                           "changes nothing a user can see until they zoom "
+                           "out" % (what, scale, source, hi))
+    return None
 
 
 def split_root(dsid, datasources):
@@ -810,7 +946,8 @@ class Report(object):
         return bool(self.only_data or self.only_resource)
 
 
-def audit(surfaces, webmap_get, service_get, item_get, before=None):
+def audit(surfaces, webmap_get, service_get, item_get, before=None,
+          scale=0):
     """Audit one app. surfaces is [(name, loader)]; loaders raise Unread.
     item_get reads a Map Image Layer item's /data. before maps a service url
     to a loader of that service's description from before a republish.
@@ -876,7 +1013,11 @@ def audit(surfaces, webmap_get, service_get, item_get, before=None):
     report.unused_before = sorted(set(before) - set(services))
     report.items_total = len([u for u in services if isinstance(u, tuple)])
     report.services_total = len(services) - report.items_total
+    by_name = dict(apps)
     for name, ref, verdict in verdicts:
+        if ref.filtered and verdict.status == OK:
+            verdict = scale_check(ref.dsid, by_name[name], webmaps,
+                                  scale) or verdict
         if verdict.status == DANGLING and ref.inert:
             verdict = Verdict(INERT, "%s. %s" % (verdict.reason, ref.inert))
         elif verdict.status == WARN and ref.inert:
@@ -998,6 +1139,8 @@ def describe(report):
                     % (report.count(RENUMBERED), report.count(DRIFTED)))
     if report.count(WARN):
         out[-1] += ", %d warn" % report.count(WARN)
+    if report.count(HIDDEN):
+        out[-1] += ", %d out of scale" % report.count(HIDDEN)
     code = exit_code(report)
     if code == 2 and (report.unread or report.count(UNJUDGED)):
         verdict = ("INCOMPLETE. Something could not be read, so this run "
@@ -1035,6 +1178,10 @@ def describe(report):
         verdict += (" %d widget binding(s) read a sublayer that the web map "
                     "hides or omits: see WARN."
                     % len([k for k, _ in grouped(report) if k[3] == WARN]))
+    if code == 0 and report.count(HIDDEN):
+        verdict += (" %d filter binding(s) act on a layer that its scale "
+                    "range hides when the app opens: see OUT OF SCALE."
+                    % len([k for k, _ in grouped(report) if k[3] == HIDDEN]))
     if report.diverged:
         verdict += (" The builder draft and the published copy bind widgets "
                     "differently: see DIVERGED.")
@@ -1064,7 +1211,8 @@ def document(report, source):
                        "unjudged": report.count(UNJUDGED),
                        "inert": report.count(INERT),
                        "notAudited": report.count(NOT_AUDITED),
-                       "warn": report.count(WARN)},
+                       "warn": report.count(WARN),
+                       "outOfScale": report.count(HIDDEN)},
             "drift": {"renumbered": report.count(RENUMBERED),
                       "drifted": report.count(DRIFTED),
                       "unusedBefore": report.unused_before}}
@@ -1871,6 +2019,19 @@ class _Parser(argparse.ArgumentParser):
         self.exit(64)
 
 
+def scale_arg(text):
+    """argparse type: a positive, finite scale denominator."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0
+    if not 0 < value < float("inf"):
+        raise argparse.ArgumentTypeError(
+            "%s is not a scale. Give the denominator, such as 24000 for "
+            "1:24000" % text)
+    return value
+
+
 def _parse(argv):
     ap = _Parser(
         prog="deadwidget.py",
@@ -1901,6 +2062,11 @@ def _parse(argv):
                     help="a service's ?f=json description saved before a "
                          "republish. A layer whose name moved to another id "
                          "is RENUMBERED. Repeatable.")
+    ap.add_argument("--app-scale", dest="app_scale", type=scale_arg,
+                    default=0, metavar="DENOMINATOR",
+                    help="the scale the app opens at, as the denominator "
+                         "(24000 for 1:24000). A filter on a layer whose "
+                         "scale range hides it there is OUT OF SCALE.")
     ap.add_argument("--dashboard", action="store_true",
                     help="the input is an ArcGIS Dashboards item's /data, not "
                          "an Experience Builder app")
@@ -2136,9 +2302,10 @@ def main(argv=None, environ=None):
     if args.apply and not args.out:
         return _usage("--apply needs --out")
     if args.dashboard and (args.resource or args.service or args.layer_item
-                           or args.before):
-        return _usage("--resource, --service, --layer-item and --before are "
-                      "Experience Builder inputs. A dashboard takes --webmap, "
+                           or args.before or args.app_scale):
+        return _usage("--resource, --service, --layer-item, --before and "
+                      "--app-scale are Experience Builder inputs. A dashboard "
+                      "takes --webmap, "
                       "--dash-layer and --dash-service")
     if not args.dashboard and (args.dash_layer or args.dash_service):
         return _usage("--dash-layer and --dash-service need --dashboard")
@@ -2186,7 +2353,8 @@ def main(argv=None, environ=None):
             loaders = _online(args, token) if online else _offline(args)
         except ValueError as exc:
             return _usage(exc)
-        return _run(args, token, *loaders, before=before)
+        return _run(args, token, *loaders, before=before,
+                    scale=args.app_scale)
     except Exception as exc:
         # Deliberately broad. Exit 1 means "dangling references found", so a
         # crash on input nobody foresaw must never leave with it.
@@ -2218,9 +2386,9 @@ def flushed(code, stream):
 
 
 def _run(args, token, surfaces, webmap_get, service_get, item_get, source,
-         before=None):
+         before=None, scale=0):
     """Audit, print, and write the report file behind --apply."""
-    report = audit(surfaces, webmap_get, service_get, item_get, before)
+    report = audit(surfaces, webmap_get, service_get, item_get, before, scale)
     return _emit(args, token, describe(report),
                  lambda: document(report, source), exit_code(report))
 
@@ -2589,7 +2757,8 @@ def self_test():
     check(index_webmap({"operationalLayers": [
         {"id": "G", "layerType": "GroupLayer", "layers": 7}],
         "tables": 5})[0] == {"G": {"kind": "layer", "title": "G",
-                                   "check": None, "opaque": None}},
+                                   "check": None, "opaque": None,
+                                   "range": (0, 0)}},
           "a group's layers and a tables key that are not lists are ignored")
 
     # ---- a layers array with scale ranges is exclusive, one without is
@@ -3256,7 +3425,7 @@ def self_test():
     doc = document(report, "app.json")
     check(doc["counts"] == {"found": 15, "ok": 5, "dangling": 4,
                             "unjudged": 3, "inert": 2, "notAudited": 1,
-                            "warn": 0} and
+                            "warn": 0, "outOfScale": 0} and
           doc["exit"] == 2 and doc["unread"] == [] and
           [f["status"] for f in doc["findings"]] ==
           [DANGLING, UNJUDGED, NOT_AUDITED, INERT],
