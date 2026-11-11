@@ -1966,6 +1966,12 @@ def parse_services(specs, flag="--service"):
     out = {}
     for spec in specs:
         url, sep, path = spec.partition("=")
+        if "?" in url or "#" in url:
+            # Split at the first "=", a url typed with ?token=X reads as
+            # url "...?token" and file "X". The spec is not echoed.
+            raise ValueError("%s takes URL=FILE, and URL must carry no "
+                             "query string or fragment. A token never "
+                             "belongs here" % flag)
         root = service_root(url)[0]
         if not sep or not path or not root:
             raise ValueError("%s takes URL=FILE, where URL is a "
@@ -2554,7 +2560,7 @@ def self_test():
     app, webmap, services = fixture(base)
 
     def run(app_doc, webmap_doc=None, service_docs=None, resource=None,
-            items=None, before=None):
+            items=None, before=None, scale=0):
         docs = services if service_docs is None else service_docs
         surfaces = [(DATA, lambda: app_doc)]
         if resource is not None:
@@ -2574,7 +2580,7 @@ def self_test():
             if item not in (items or {}):
                 raise Unread("no layer item")
             return items[item]
-        return audit(surfaces, wm_get, svc_get, item_get, before)
+        return audit(surfaces, wm_get, svc_get, item_get, before, scale)
 
     def only_map_of(item):
         return {"widgets": {"widget_1": {"useDataSources": [
@@ -3705,6 +3711,190 @@ def self_test():
           "a nested sublayer is not judged for visibility, a top-level one "
           "is")
 
+    # ---- a filter on a layer that its scale range hides: OUT OF SCALE
+    sbase = "https://gis.example.com/server/rest/services"
+    parcels = sbase + "/Land/Parcels/FeatureServer"
+    wells = sbase + "/Land/Wells/FeatureServer"
+    roads_s = sbase + "/Land/Roads/MapServer"
+    scale_wm = {"operationalLayers": [
+        {"id": "P1", "layerType": "ArcGISFeatureLayer", "title": "Parcels",
+         "url": parcels + "/0", "minScale": 24000},
+        {"id": "W1", "layerType": "ArcGISFeatureLayer", "title": "Wells",
+         "url": wells + "/0", "layerDefinition": {"maxScale": 5000}},
+        {"id": "O1", "layerType": "ArcGISFeatureLayer", "title": "Open",
+         "url": wells + "/1"},
+        {"id": "R1", "layerType": "ArcGISMapServiceLayer", "title": "Roads",
+         "url": roads_s, "layers": [{"id": 0, "minScale": 10000}, {"id": 1}]},
+        {"id": "R2", "layerType": "ArcGISMapServiceLayer", "title": "Streets",
+         "url": roads_s, "minScale": 8000, "layers": [{"id": 0}, {"id": 1}]},
+        {"id": "G1", "layerType": "GroupLayer", "title": "Land",
+         "minScale": 24000, "layers": [
+             {"id": "G1C", "layerType": "ArcGISFeatureLayer",
+              "title": "Child", "url": wells + "/1"}]}],
+        "initialState": {"viewpoint": {"scale": 100000}}}
+    scale_svc = {parcels: {"layers": [{"id": 0}]},
+                 wells: {"layers": [{"id": 0}, {"id": 1}]},
+                 roads_s: {"layers": [{"id": 0}, {"id": 1}]}}
+
+    def filter_app(*dsids, **extra):
+        """A Map widget, and a Filter widget with one filter per data
+        source id. extra replaces the Map widget's config."""
+        items = [{"dataSource": {"dataSourceId": "dataSource_1-" + dsid}}
+                 for dsid in dsids]
+        return {"widgets": {
+            "widget_1": {"label": "Map", "useDataSources": [
+                {"dataSourceId": "dataSource_1"}],
+                "config": extra.get("config", {})},
+            "widget_2": {"label": "Filter", "config": {
+                "filterItems": items}}},
+            "dataSources": {"dataSource_1": {"type": "WEB_MAP",
+                                             "itemId": wm_id}}}
+
+    def scaled(dsid, scale=0, wm_doc=scale_wm, **extra):
+        got = run(filter_app(dsid, **extra), wm_doc, scale_svc, scale=scale)
+        return [v for _, r, v in got.findings if r.filtered][0], got
+
+    check([scale_value(x) for x in (0, -5, True, "24000", None,
+                                    float("inf"), float("nan"), 24000,
+                                    1.5)] == [0, 0, 0, 0, 0, 0, 0, 24000,
+                                              1.5],
+          "a scale limit is a positive finite number, and a web map's 0 "
+          "means none")
+    verdict, report = scaled("P1")
+    lines = describe(report)
+    check(verdict.status == HIDDEN and exit_code(report) == 0 and
+          "its minimum scale is 1:24000" in verdict.reason and
+          "1:100000 (the web map's initial viewpoint)" in verdict.reason and
+          lines[-1] == "VERDICT: every data source reference resolves. 1 "
+          "filter binding(s) act on a layer that its scale range hides when "
+          "the app opens: see OUT OF SCALE." and
+          "1 out of scale" in [x for x in lines
+                               if x.startswith("references:")][0],
+          "a filter on a layer whose minimum scale is smaller than the "
+          "app's scale is OUT OF SCALE, exit 0, and the verdict does not "
+          "read as plainly clean  <-- pinned defect")
+    check(document(report, "app.json")["counts"]["outOfScale"] == 1 and
+          [f["status"] for f in document(report, "app.json")["findings"]]
+          == [HIDDEN], "the report document counts it")
+    check(scaled("P1", 24000)[0].status == OK and
+          scaled("P1", 23999)[0].status == OK and
+          scaled("P1", 24001)[0].status == HIDDEN,
+          "a layer is drawn at exactly its minimum scale and hidden one "
+          "denominator past it")
+    verdict, _ = scaled("W1", 3000)
+    check(verdict.status == HIDDEN and
+          "its maximum scale is 1:5000" in verdict.reason and
+          "until they zoom out" in verdict.reason and
+          scaled("W1", 5000)[0].status == OK and
+          scaled("W1", 12000)[0].status == OK,
+          "a scale smaller than the maximum scale is OUT OF SCALE, read "
+          "from the layer's layerDefinition, and the maximum itself is "
+          "drawn")
+    ldef = copy(scale_wm)
+    ldef["operationalLayers"][0]["layerDefinition"] = {"minScale": 1000}
+    check(scaled("P1", 5000, ldef)[0].status == OK and
+          scaled("P1", 30000, ldef)[0].status == HIDDEN,
+          "the value on the layer entry wins over its layerDefinition")
+    check(scaled("O1", 999999)[0].status == OK and
+          scaled("O1")[0].status == OK,
+          "a layer that sets no range is OK at any scale, and the scale "
+          "need not be known")
+    verdict, _ = scaled("R1-0", 50000)
+    check(verdict.status == HIDDEN and
+          "sublayer 0 of 'Roads'" in verdict.reason and
+          scaled("R1-1", 50000)[0].status == OK,
+          "a Map Service sublayer's own range in the web map layers array "
+          "hides a filter on that sublayer and no other")
+    verdict, _ = scaled("R2-1", 50000)
+    check(verdict.status == HIDDEN and "layer 'Streets'" in verdict.reason
+          and scaled("R2-1", 8000)[0].status == OK,
+          "the range of the map service layer hides every sublayer of it")
+    check(scaled("G1-G1C", 100000)[0].status == OK,
+          "a range on a group layer is not applied to its children (Limits)")
+    near = copy(scale_wm)
+    near["initialState"]["viewpoint"]["scale"] = 12000
+    check(scaled("P1", 0, near)[0].status == OK and
+          scaled("P1", 13000, near)[0].status == OK and
+          scaled("P1", 0, scale_wm)[0].status == HIDDEN,
+          "the viewpoint scale of the web map is the app's scale")
+    extent = copy(scale_wm)
+    extent["initialState"] = {"viewpoint": {"targetGeometry": {"xmin": 0}}}
+    verdict, report = scaled("P1", 0, extent)
+    check(verdict.status == UNJUDGED and exit_code(report) == 2 and
+          "Give --app-scale" in verdict.reason and
+          "records an extent or nothing" in verdict.reason and
+          scaled("O1", 0, extent)[0].status == OK,
+          "a viewpoint that records an extent gives no scale: a ranged "
+          "filter layer is UNJUDGED, exit 2, and an unranged one is OK  "
+          "<-- pinned defect")
+    check(scaled("P1", 100000, extent)[0].status == HIDDEN and
+          scaled("P1", 12000, extent)[0].status == OK,
+          "--app-scale gives the verdict when the web map records only an "
+          "extent")
+    nostate = copy(scale_wm)
+    del nostate["initialState"]
+    check(scaled("P1", 0, nostate)[0].status == UNJUDGED and
+          index_webmap(nostate).scale == 0 and
+          index_webmap(scale_wm).scale == 100000,
+          "a web map with no initialState gives no scale")
+    mapcfg = {"config": {"isUseCustomMapState": True}}
+    verdict, _ = scaled("P1", 0, **mapcfg)
+    check(verdict.status == UNJUDGED and "sets its own initial view" in
+          verdict.reason and custom_view(filter_app("P1", **mapcfg)) and
+          not custom_view(filter_app("P1")) and
+          scaled("P1", 0, **{"config": {"initialMapState": {}}})[0].status
+          == HIDDEN, "a map widget's custom initial view makes the scale "
+          "unknown, so a ranged filter layer is UNJUDGED  <-- pinned defect")
+    check(scaled("P1", 100000, **mapcfg)[0].status == HIDDEN,
+          "and --app-scale still wins over a custom initial view")
+    check(custom_view({"widgets": {"widget_1": "not a widget",
+                                   "widget_2": {"config": "x"}}}) is False,
+          "a widget that is no object does not crash the view check")
+    dangle = run(filter_app("P1-9"), scale_wm, scale_svc, scale=100000)
+    check(dangle.count(HIDDEN) == 0 and dangle.count(DANGLING) == 1,
+          "a filter on a layer the web map lacks is DANGLING, never OUT OF "
+          "SCALE (Limits)")
+    root_app = filter_app("P1")
+    root_app["widgets"]["widget_2"]["config"]["filterItems"].append(
+        {"dataSource": {"dataSourceId": "dataSource_1"}})
+    root_app["dataSources"]["dataSource_2"] = {
+        "type": "MAP_SERVICE", "url": roads_s}
+    root_app["widgets"]["widget_2"]["config"]["filterItems"].append(
+        {"dataSource": {"dataSourceId": "dataSource_2-0"}})
+    got = run(root_app, scale_wm, scale_svc, scale=100000)
+    check(sorted(v.status for _, r, v in got.findings if r.filtered)
+          == [OK, OK, HIDDEN], "a filter bound to the web map itself, or to "
+          "a map service data source, gets no scale verdict")
+    table_app = filter_app("P1")
+    table_app["widgets"]["widget_3"] = {"label": "Table", "useDataSources": [
+        {"dataSourceId": "dataSource_1-P1"}]}
+    got = run(table_app, scale_wm, scale_svc, scale=100000)
+    check(sorted(v.status for _, r, v in got.findings
+                 if r.dsid.endswith("P1")) == [OK, HIDDEN],
+          "only a filter is checked for scale: a Table on the same layer "
+          "gets no finding (Limits)")
+    hidden_wm = copy(scale_wm)
+    hidden_wm["operationalLayers"].append(
+        {"id": "M2", "layerType": "ArcGISMapServiceLayer", "title": "Mains",
+         "url": roads_s, "visibleLayers": [0], "minScale": 24000,
+         "layers": [{"id": 0}]})
+    got = run(filter_app("M2-1"), hidden_wm, scale_svc, scale=100000)
+    check(statuses(got)["dataSource_1-M2-1"] == WARN and
+          got.count(HIDDEN) == 0,
+          "a reference that is WARN gets no scale verdict (Limits)")
+    stale = filter_app("P1")
+    stale["widgets"]["widget_3"] = {"config": {"tableMode": "MAP", "layersConfig": [
+        {"filterItems": [{"dataSource": {"dataSourceId": "dataSource_1-P1"}}]}
+    ]}}
+    got = run(stale, scale_wm, scale_svc, scale=100000)
+    check([v.status for _, r, v in got.findings if r.inert] == [HIDDEN],
+          "a filter inside an inert block that is OK is still OUT OF SCALE "
+          "(Limits)")
+    check(sublayer_ranges({"layers": ["x", {"id": None}, {"id": 3,
+                                                          "minScale": 9}]})
+          == {"3": (9, 0)} and sublayer_ranges({"layers": 5}) == {},
+          "a sublayer entry that is no object, or has no id, is skipped")
+
     # ---- small helpers
     check(same_name(u"Caf\u00e9", u" caf\u00e9 ") and
           not same_name(u"Caf\u00e9", u"Cafe\u0301"),
@@ -4096,6 +4286,62 @@ def self_test():
           "a file and a portal together are a usage error  <-- pinned defect")
     check(run_cli([app_file, "--apply"])[0] == 64,
           "--apply without --out is a usage error")
+    # ---- --app-scale, offline
+    sc_app = put("sc_app.json", filter_app("P1"))
+    sc_wm = put("sc_wm.json", scale_wm)
+    sc_ext = put("sc_ext.json", extent)
+    sc_args = ["--service", "%s=%s" % (parcels, put(
+        "sc_parcels.json", scale_svc[parcels]))]
+    code, out, err = run_cli([sc_app, "--webmap", sc_wm] + sc_args)
+    check(code == 0 and "OUT OF SCALE" in out and "1:100000 (the web "
+          "map's initial viewpoint)" in out and "--app-scale" not in out,
+          "offline: a filter hidden by the web map's own viewpoint scale "
+          "prints OUT OF SCALE and exits 0")
+    code, out, err = run_cli([sc_app, "--webmap", sc_ext] + sc_args)
+    check(code == 2 and "UNJUDGED" in out and "Give --app-scale" in out,
+          "offline: an extent-only viewpoint is UNJUDGED and exits 2")
+    code, out, err = run_cli([sc_app, "--webmap", sc_ext, "--app-scale",
+                              "100000"] + sc_args)
+    check(code == 0 and "OUT OF SCALE" in out and "(--app-scale)" in out,
+          "offline: --app-scale gives the verdict, and names where the "
+          "scale came from")
+    code, out, err = run_cli([sc_app, "--webmap", sc_ext, "--app-scale",
+                              "12000"] + sc_args)
+    check(code == 0 and "OUT OF SCALE" not in out and "UNJUDGED" not in out,
+          "offline: a scale inside the range is clean")
+    kept = read_json_file(report_file)
+    code, out, err = run_cli([sc_app, "--webmap", sc_wm, "--out",
+                              report_file] + sc_args)
+    check(read_json_file(report_file) == kept and "wrote" not in out,
+          "--out without --apply writes nothing, even for a scale finding")
+    code, out, err = run_cli([sc_app, "--webmap", sc_wm, "--out", report_file,
+                              "--apply"] + sc_args)
+    written = read_json_file(report_file)
+    check(code == 0 and written["counts"]["outOfScale"] == 1 and
+          written["findings"][0]["status"] == HIDDEN and written["exit"] == 0,
+          "--apply writes the OUT OF SCALE finding and the count to the "
+          "report")
+    check([scale_arg(x) for x in ("24000", "1e5", " 5 ")] ==
+          [24000.0, 100000.0, 5.0], "a scale argument is a plain number")
+    codes = [run_cli([sc_app, "--webmap", sc_wm, "--app-scale", bad]
+                     + sc_args)[0]
+             for bad in ("nan", "inf", "0", "-5", "abc", "1:24000", "")]
+    check(codes == [64] * 7,
+          "a scale that is not a positive finite number exits 64  "
+          "<-- pinned defect")
+    code, out, err = run_cli([sc_app, "--webmap", sc_wm, "--app-scale",
+                              "abc"] + sc_args)
+    check("abc is not a scale" in err and "24000 for 1:24000" in err,
+          "and the error names the fix")
+    for flag in ("--service", "--before"):
+        code, out, err = run_cli([sc_app, "--webmap", sc_wm, flag,
+                                  parcels + "?token=QSECRET99"])
+        check(code == 64 and "QSECRET99" not in out + err and
+              "no query string" in err,
+              "%s with a url typed with ?token= and no FILE is a usage "
+              "error that does not echo the token  <-- pinned defect" % flag)
+    check(run_cli([sc_app, "--dashboard", "--app-scale", "24000"])[0] == 64,
+          "--app-scale is refused for a dashboard")
     check(run_cli([app_file, "--bogus"])[0] == 64,
           "an unknown flag exits 64, not argparse's 2  <-- pinned defect")
     code, out, err = run_cli(["--portal", "https://x"])

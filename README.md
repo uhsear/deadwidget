@@ -15,7 +15,8 @@ that gives an old id to a different layer, so the widget reads the wrong layer. 
 a renumber, because the old id still exists. Only a recorded name can. The tool uses the name that
 the web map records for a sublayer, or the service description that you saved before the republish
 (`--before`). With no recorded name it checks that the id exists, and the report says so. It also
-warns when the web map hides a sublayer that a widget reads. With `--dashboard` it lints an ArcGIS
+warns when the web map hides a sublayer that a widget reads, and when a Filter widget filters a
+layer that the layer's own scale range hides at the scale the app opens at. With `--dashboard` it lints an ArcGIS
 Dashboards item with twelve rules, for example a chart series bound to a field that its dataset
 does not return.
 
@@ -61,21 +62,23 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-429 assertions, 0 failed
+464 assertions, 0 failed
 ```
 
-The full run prints all 429 assertions. The `...` line above is where this block is cut.
+The full run prints all 464 assertions. The `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 429 assertions pass on Windows (Python 3.13.2 and 3.9.25) and on Ubuntu (Python 3.12.3),
-with `-W error`, and the three runs print identical output. Branch coverage of `deadwidget.py`
-under `--self-test` is 100 percent, measured on Windows with Python 3.13.2 and `coverage run
---branch`, with no line excluded. `pyflakes` reports nothing on Windows. The Ubuntu host has
-neither `coverage` nor `pyflakes`.
+The same 464 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
+`-W error`, and the two runs print identical output. Branch coverage of `deadwidget.py` under
+`--self-test` is 100 percent (2617 statements, 722 branches), measured on Windows with Python
+3.13.2 and `coverage run --branch`, with no line excluded. `pyflakes` reports nothing on Windows.
+The Ubuntu host has neither `coverage` nor `pyflakes`. A Python 3.9 interpreter was not available
+for the last change. The file parses with `ast.parse(..., feature_version=(3, 9))`, and an earlier
+version of the self-test passed on 3.9.25.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -91,6 +94,7 @@ python deadwidget.py --self-test
 python deadwidget.py app.json --webmap webmap.json --service URL=service.json
 python deadwidget.py app.json --resource config.json --webmap ITEMID=webmap.json --service URL=service.json
 python deadwidget.py app.json --webmap webmap.json --service URL=service.json --layer-item ITEMID=item.json
+python deadwidget.py app.json --webmap webmap.json --service URL=service.json --app-scale 24000
 python deadwidget.py app.json --webmap webmap.json --service URL=after.json --before URL=before.json
 python deadwidget.py dash.json --dashboard --dash-layer ITEMID/LAYERID=layer.json
 python deadwidget.py app.json --webmap webmap.json --out report.json --apply
@@ -126,6 +130,7 @@ python deadwidget.py --dashboard --portal https://org.maps.arcgis.com --item <da
 | `--service` | none | A service description as `URL=FILE`. Repeatable. The tool names each url it needs. |
 | `--layer-item` | none | A Map Image Layer item's `/data` as `ITEMID=FILE`, for a web map layer added from that item. Repeatable. The tool names each item it needs. |
 | `--before` | none | A service description as `URL=FILE`, saved before a republish. A layer whose name moved to another id is `RENUMBERED`. Repeatable. A url that no reference needs exits 2. |
+| `--app-scale` | none | The scale the app opens at, as the denominator: `24000` for 1:24000. It must be a positive finite number, or the run exits 64. It wins over the web map's viewpoint. A filter on a layer whose scale range hides it at this scale is `OUT OF SCALE`. Not for `--dashboard`. |
 | `--dashboard` | off | The input is an ArcGIS Dashboards item's `/data`, not an Experience Builder app. See Dashboards. |
 | `--dash-layer` | none | With `--dashboard`, offline: a layer description as `ITEMID/LAYERID=FILE`, for the layer a dataset names. Repeatable. |
 | `--dash-service` | none | With `--dashboard`, offline: a layer item's service description as `ITEMID=FILE`, to tell a removed layer from an unread one. Repeatable. |
@@ -172,7 +177,8 @@ looks the rest up in the web map. For a map service layer, it also reads the ser
 | `RENUMBERED` | The id exists, but a recorded name shows it now names another layer: the web map entry's name, or the `--before` description, is published under a different id. | exit 1 |
 | `DRIFTED` | The id exists and its recorded name changed, and no layer the service publishes carries the old name. A rename and a renumber look the same, so the run cannot call it clean. | exit 2 |
 | `WARN` | The id resolves, but the web map hides the sublayer (`visibleLayers`) or omits it from a `layers` array that does not decide the sublayers. Advisory. | no |
-| `UNJUDGED` | The web map, the service or the layer item needed to decide could not be read. | exit 2 |
+| `OUT OF SCALE` | The id resolves and a Filter widget filters it, but a scale range of the layer hides it at the scale the app opens at. Advisory. | no |
+| `UNJUDGED` | The web map, the service or the layer item needed to decide could not be read. Also a filtered layer that sets a scale range when the scale the app opens at is not known. | exit 2 |
 | `INERT` | Dangling, but in an entry that no widget reads. There are two such places. The first is the `layersConfig` of a table in `MAP` mode. That table makes one tab per map layer, so the entry makes no tab. The second is a Swipe or Map Layers block kept for a map view that no longer exists (see below). The counts line gives the `INERT` count, and so does the verdict when nothing fails the run. | no |
 | `NOT AUDITED` | A child of a web scene, a widget output, a subtype group layer, a knowledge graph layer, a feature collection, or another type this tool does not model. Nothing checked it, so it is not clean. | exit 2 |
 
@@ -290,6 +296,74 @@ found that a Near Me widget sent no request for a category whose sublayer was hi
 JavaScript trusts such an array only when an entry sets a scale range (see Limits), and one
 observation of a running app found a sublayer missing without one. A nested sublayer is not
 judged. A `WARN` on a reference that no widget reads is dropped.
+
+**A filter on a layer that its scale range hides.** A web map layer, and a sublayer entry in a
+map service layer's `layers` array, can set `minScale` and `maxScale`. Esri's map service
+reference defines them: `minScale` is "the minimum scale (most zoomed out) at which the service
+layer is visible in the map view", `maxScale` is "the maximum scale (most zoomed in)", and "a value
+of 0 means the layer does not have a minimum scale", and likewise for the maximum. The web map
+specification says only that a layer's `minScale` and `maxScale` give "the minimum scale at which
+the layer is displayed" and "the maximum scale". It does not state the direction. So the tool takes
+the web map's values to mean what the map service reference says. A layer is hidden when the
+app's scale denominator is larger than `minScale`, or smaller than `maxScale`. A scale equal to a
+limit is drawn. A Filter widget on a hidden layer changes nothing that a user can see until the
+user zooms.
+
+The tool takes the scale the app opens at from these, in order:
+
+1. `--app-scale`.
+2. Nothing, when a map widget keeps a custom initial view. Esri's Map widget help says that the
+   Default option uses "the positioning of the map inherited from the web map or web scene", and a
+   custom view replaces it. The tool does not read a custom view.
+3. The web map's `initialState.viewpoint.scale`. The web map specification says the viewpoint
+   `scale` is optional, and that when it is omitted it is "automatically calculated such that it is
+   just small enough to fit the entire targetGeometry within the view". That scale depends on the
+   size of the window, so the tool does not guess it.
+
+When a filtered layer sets a range and none of these gives a scale, the layer is `UNJUDGED` and the
+run exits 2. Give `--app-scale` to get a verdict. A layer that sets no range needs no scale. The
+tool checks only a filter: a reference whose path ends in
+`.filterItems[n].dataSource.dataSourceId`. Esri does not document the keys that the Filter widget
+saves, and the keys of a custom initial view are not documented either. Check both against your own
+app.
+
+This run reads a synthetic app with one Filter widget, bound to a layer `Parcels` with `minScale`
+24000. The web map opens at 1:100000.
+
+```
+$ python deadwidget.py app.json --webmap webmap.json --service https://gis.example.com/server/rest/services/Land/Parcels/FeatureServer=parcels.json
+deadwidget: published copy, 2 widget(s), 2 data source reference(s)
+web maps read: 1 of 1, services read: 1 of 1
+
+OUT OF SCALE dataSource_1-18f00000001-layer-4
+             widget_2 (Parcel filter), in the published copy
+             layer 'Parcels' is not drawn at 1:100000 (the web map's initial viewpoint), because its minimum scale is 1:24000. A filter on it changes nothing a user can see until they zoom in
+             at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
+
+references: 2 found, 1 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 1 out of scale
+VERDICT: every data source reference resolves. 1 filter binding(s) act on a layer that its scale range hides when the app opens: see OUT OF SCALE.
+(exit 0)
+```
+
+When the web map records only an extent, the run cannot tell the scale and exits 2:
+
+```
+$ same command with webmap_extent.json
+deadwidget: published copy, 2 widget(s), 2 data source reference(s)
+web maps read: 1 of 1, services read: 1 of 1
+
+UNJUDGED     dataSource_1-18f00000001-layer-4
+             widget_2 (Parcel filter), in the published copy
+             layer 'Parcels' sets a scale range, and the scale the app opens at is not known: the web map's initial viewpoint records an extent or nothing, and an extent gives a scale only for a known window size. Give --app-scale
+             at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
+
+references: 2 found, 1 ok, 0 dangling, 1 unjudged, 0 inert, 0 not audited
+VERDICT: INCOMPLETE. Something could not be read, so this run proves nothing about it.
+(exit 2)
+```
+
+With `--app-scale 12000` the same files print a `NOTE` that the layer was checked by id only, the
+verdict `every data source reference resolves.`, and exit 0.
 
 **The two copies of the configuration.** An Experience Builder app stores its configuration
 twice. The item `/data` is the published copy, and users get it. The `config/config.json` resource
@@ -415,9 +489,9 @@ layer items and their services over REST. The self-test serves those from a loop
 
 | Code | Meaning |
 |---|---|
-| 0 | Every reference resolves in every copy the run audited. That is the published copy, and also the draft when `--resource` is given or the run is online. The copies can still diverge, and a `WARN` or an id-only `NOTE` can remain. Both are reported. For a dashboard: no `BROKEN` finding. |
+| 0 | Every reference resolves in every copy the run audited. That is the published copy, and also the draft when `--resource` is given or the run is online. The copies can still diverge, and a `WARN` or an id-only `NOTE` can remain. Both are reported. An `OUT OF SCALE` filter is reported in the verdict only, and it does not change the exit code, as `WARN` does not, so a job that reads only the exit code does not see it. For a dashboard: no `BROKEN` finding. |
 | 1 | A reference is dangling or `RENUMBERED` in the published copy or in the draft. For a dashboard: a `BROKEN` finding. |
-| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer, or `DRIFTED`. A `--before` url that no reference needed. An app with no widget and no reference, or a dashboard with no recognised widget. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does, with or without `2>&1`. |
+| 2 | An input could not be read, so something could not be judged. A reference is `NOT AUDITED`, for example a widget bound to a web scene layer, or `DRIFTED`. A filtered layer that sets a scale range when the scale is not known, so give `--app-scale`. A `--before` url that no reference needed. An app with no widget and no reference, or a dashboard with no recognised widget. The tool failed on input it did not expect. The report file could not be written. The reader of the output closed it early, as `\| head` does, with or without `2>&1`. |
 | 64 | Usage error. |
 
 Exit 2 beats exit 1. A web map that could not be read is not a web map known to be clean, and a
@@ -574,6 +648,32 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   SDK.
 - The README's claims about `@arcgis/core` `sublayerUtils.js` and `SublayersOwner.js` are read from
   the SDK's code, not measured in a running app.
+- A scale range is read only from the web map: the layer's own `minScale` and `maxScale`, and a
+  map service sublayer's entry in the web map's `layers` array. A default range that the service
+  publishes in its `?f=json` (`layers[].minScale`) is never read. A filter on a layer that the
+  service hides by default, with no range in the web map, gets no finding.
+- A scale range set on a group layer is not applied to the layers inside it. A group with
+  `minScale` 24000, a child with none and an app scale of 1:100000 gives `OK`, with no `OUT OF
+  SCALE`. This was not checked against the ArcGIS Maps SDK for JavaScript offline, so the SDK may
+  apply a group's range to its children, and then the tool reports less than it should.
+- The scale check runs only on a filter reference that already resolved `OK`. A reference that is
+  `DANGLING`, `WARN`, `DRIFTED` or `UNJUDGED` gets no scale verdict, even when the web map alone
+  could give one. A filter reference in an `INERT` block that is `OK` stays `OUT OF SCALE`, because
+  only `DANGLING` and `WARN` are downgraded there.
+- `OUT OF SCALE` is advisory. It exits 0, and the `VERDICT` line names it, so a job that reads only
+  the exit code does not see it.
+- When the web map viewpoint records only an extent, which is the common shape, a filtered layer
+  that sets a range is `UNJUDGED` and the run exits 2. `--app-scale` is the way to get a verdict.
+  A map widget with a custom initial view has the same effect.
+- Only a reference whose path ends in `.filterItems[n].dataSource.dataSourceId` is checked for
+  scale. A Table, Search or List widget on a hidden layer gets no finding. Esri does not document
+  the keys that the Filter widget saves, so a Filter widget that stores its data source under
+  another key gets no finding either.
+- Offline input files are read whole, with no size cap. Only an online response body is capped at
+  `MAX_BODY_BYTES`.
+- A `--service` or `--before` argument is split at its first `=`. A url with a query string, such
+  as `...?token=X` with no file, is refused with exit 64, and the message does not repeat it. An
+  argument for a service that no reference needs is ignored without a message.
 - It changes nothing. Re-binding a widget is done in the builder, or with the two-copy write that
   the app then needs.
 
@@ -600,7 +700,11 @@ MIT.
 - Esri, [Web map specification, layer](https://developers.arcgis.com/web-map-specification/objects/layer/): a layer's `name` is "The name of the layer".
 - Esri, [Web map specification, mapServiceLayer](https://developers.arcgis.com/web-map-specification/objects/mapServiceLayer/): `visibleLayers` is "An array of sublayer ids that should appear visible".
 - Esri, [Web map specification, dynamicMapLayer source](https://developers.arcgis.com/web-map-specification/objects/dynamicMapLayer_source/): `mapLayerId` is "The current map layer's id".
-- Esri, [Map service resource](https://developers.arcgis.com/rest/services-reference/enterprise/map-service/): `layers[]` carry `id`, `name` and `parentLayerId`, and `tables[]` carry `id` and `name`.
+- Esri, [Map service resource](https://developers.arcgis.com/rest/services-reference/enterprise/map-service/): `layers[]` carry `id`, `name` and `parentLayerId`, and `tables[]` carry `id` and `name`. Also `minScale` is the scale "most zoomed out" at which a layer is visible, `maxScale` is "most zoomed in", and 0 means no limit. This is the source of the direction that the tool applies to web map values.
+- Esri, [Web map specification, viewpoint](https://developers.arcgis.com/web-map-specification/objects/viewpoint/): `scale` is optional, and when omitted it is calculated to fit `targetGeometry`.
+- Esri, [Web map specification, initialState](https://developers.arcgis.com/web-map-specification/objects/initialState/): the web map's `viewpoint` is "the location displayed on the map".
+- Esri, [Web map specification, layerDefinition](https://developers.arcgis.com/web-map-specification/objects/layerDefinition/): `minScale` and `maxScale` set the minimum and maximum scale at which a layer is displayed. It does not state the direction or the meaning of 0.
+- Esri, [Map widget (Experience Builder)](https://doc.arcgis.com/en/experience-builder/latest/configure-widgets/map-widget.htm): the Default initial view is "the positioning of the map inherited from the web map or web scene".
 - Esri, [Dashboards actions](https://doc.arcgis.com/en/dashboards/latest/create-and-share/actions.htm): a source and a target on different data sources need a relationship, by attribute or by geometry.
 - Esri, [solution.js issue 660](https://github.com/Esri/solution.js/issues/660): `config/config.json` holds the builder's draft, and publishing pushes the changes to the item data.
 - Esri, [Working with Web Experiences in the Python API](https://developers.arcgis.com/python/latest/guide/experience-builder-workflows/): the `datasources` property and `upload(auto_remap=True)`.
