@@ -19,7 +19,8 @@ the web map records for a sublayer, or the service description that you saved be
 warns when the web map hides a sublayer that a widget reads. It also warns when a Filter widget
 filters a layer that a scale range hides at the scale the app opens at. The range can be written in
 the web map or published by the map service. A range on a group above the layer makes the verdict
-`UNJUDGED`, because the tool does not know whether the SDK applies it to the layer. With `--dashboard` it lints an ArcGIS
+`UNJUDGED` only when that range would hide the layer at the app's scale, because the tool does not
+know whether the SDK applies it to the layer. Otherwise there is no finding. With `--dashboard` it lints an ArcGIS
 Dashboards item with twelve rules, for example a chart series bound to a field that its dataset
 does not return.
 
@@ -34,6 +35,11 @@ for Python's `arcgis.apps.expbuilder.WebExperience` exposes an app's `datasource
 `upload(auto_remap=True)` checks that each data source item can be found in a target portal. Both
 work at the level of the item. Neither one reads a widget's sublayer id or compares it with the
 layers that the service publishes. That comparison is this tool.
+
+For a scale range, the Map Viewer already shows the state of one layer: Esri's documentation says
+that "When a layer is out of range, its name appears in a lighter gray color in the Layers pane
+than the layers that are in range." That shows what the map draws at the scale you are looking at.
+It does not tell you that a Filter widget in an Experience Builder app is bound to such a layer.
 
 For a dashboard, the editor shows "Cannot access data" on a widget when you open it, one dashboard
 at a time, in a browser. A GitHub repository search on 2026-10-13 found no tool that reads a
@@ -317,7 +323,8 @@ user zooms.
 The range comes from three places. The first is the web map: the layer's own `minScale` and
 `maxScale`, or the layer's entry in a `layers` array. On one entry, the value on the entry itself is
 used first and `layerDefinition` second. The second is the service. Esri's map service resource
-lists `minScale` and `maxScale` on each entry of the root `layers` array, and the tool reads them
+shows `minScale` and `maxScale` on each entry of the root `layers` array in its examples, and defines
+them in a "New at 10.7.1" note. The tool reads them
 from the `--service` file, or from the service url online. Esri's feature service resource shows
 the same two keys in an example response and does not define them there, so the tool applies the
 map service definition to a feature service too. A number that the web map writes for one end
@@ -782,6 +789,17 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   `DANGLING`, `WARN`, `DRIFTED` or `UNJUDGED` gets no scale verdict, even when the web map alone
   could give one. A filter reference in an `INERT` block that is `OK` stays `OUT OF SCALE`, because
   only `DANGLING` and `WARN` are downgraded there.
+- A scale range that only a layer resource carries is not read, and a filter on such a layer gets
+  neither a finding nor `UNJUDGED`. The tool fetches the service root only.
+- A reference that is `WARN` because the web map's `visibleLayers` omits the sublayer gets no
+  `OUT OF SCALE` finding, even when the sublayer's range also hides it at the app's scale. The
+  `WARN` already says the sublayer is hidden, and the run exits 0 either way.
+- A widget entry whose value is not an object, such as `"w1": "text"`, is skipped without a
+  message. It counts as 0 references, and a run with no other reference exits 0. An exported
+  builder configuration does not hold such an entry.
+- `--apply` replaces an existing `--out` file without asking and keeps no backup, unless that file
+  is one of the inputs, which the tool refuses. A full disk during the write leaves a partial
+  report and the run exits 2.
 - `OUT OF SCALE` is advisory and exits 0. Read the `VERDICT` line or the `--out` report. A job that
   reads only the exit code does not see it.
 - A scale limit that is not a number, such as the string `"24000"`, is read as no limit.
@@ -872,7 +890,8 @@ MIT.
 - Esri, [Web map specification, layer](https://developers.arcgis.com/web-map-specification/objects/layer/): a layer's `name` is "The name of the layer".
 - Esri, [Web map specification, mapServiceLayer](https://developers.arcgis.com/web-map-specification/objects/mapServiceLayer/): `visibleLayers` is "An array of sublayer ids that should appear visible".
 - Esri, [Web map specification, dynamicMapLayer source](https://developers.arcgis.com/web-map-specification/objects/dynamicMapLayer_source/): `mapLayerId` is "The current map layer's id".
-- Esri, [Map service resource](https://developers.arcgis.com/rest/services-reference/enterprise/map-service/): its JSON example shows `layers[]` entries with `id`, `name`, `parentLayerId`, `defaultVisibility`, `subLayerIds`, `minScale` and `maxScale`, and `tables[]` entries with `id` and `name`. The text says `minScale` is the scale "most zoomed out" at which a layer is visible, `maxScale` is "most zoomed in", and 0 means no limit. This is the source of the direction that the tool applies to web map values, and of the range it reads from the service.
+- Esri, [Map service resource](https://developers.arcgis.com/rest/services-reference/enterprise/map-service/): the page names `minScale` and `maxScale` in its JSON template and examples, and defines them in a "New at 10.7.1" note. Its JSON example shows `layers[]` entries with `id`, `name`, `parentLayerId`, `defaultVisibility`, `subLayerIds`, `minScale` and `maxScale`, and `tables[]` entries with `id` and `name`. The text says `minScale` is the scale "most zoomed out" at which a layer is visible, `maxScale` is "most zoomed in", and 0 means no limit. This is the source of the direction that the tool applies to web map values, and of the range it reads from the service.
+- Esri, [Set transparency and visible range (Map Viewer)](https://enterprise.arcgis.com/en/portal/11.1/use/set-transparency-and-visible-range-mv.htm) (Portal for ArcGIS 11.1): an out-of-range layer's name is lighter gray in the Layers pane.
 - Esri, [Feature service resource](https://developers.arcgis.com/rest/services-reference/enterprise/feature-service/): the JSON example shows `minScale` and `maxScale` on `layers[]` entries. The page has no sentence that defines them.
 - Esri, [Web map specification, viewpoint](https://developers.arcgis.com/web-map-specification/objects/viewpoint/): `scale` is optional, and when omitted it is calculated to fit `targetGeometry`.
 - Esri, [Web map specification, initialState](https://developers.arcgis.com/web-map-specification/objects/initialState/): the web map's `viewpoint` is "the location displayed on the map".
