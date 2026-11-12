@@ -81,9 +81,9 @@ The same 488 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.
 Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2747 statements, 756
 branches), measured on Windows with Python 3.13.2 and `coverage run --branch`, with no line
 excluded. `pyflakes` reports nothing on Windows.
-The Ubuntu host has neither `coverage` nor `pyflakes`. A Python 3.9 interpreter was not available
-for the last change. The file parses with `ast.parse(..., feature_version=(3, 9))`, and an earlier
-version of the self-test passed on 3.9.25.
+The Ubuntu host has neither `coverage` nor `pyflakes`. The file parses with
+`ast.parse(..., feature_version=(3, 9))`, and `-W error deadwidget.py --self-test` prints
+`488 assertions, 0 failed` on Windows with Python 3.9.25 as well.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -766,11 +766,18 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   `DANGLING`, `WARN`, `DRIFTED` or `UNJUDGED` gets no scale verdict, even when the web map alone
   could give one. A filter reference in an `INERT` block that is `OK` stays `OUT OF SCALE`, because
   only `DANGLING` and `WARN` are downgraded there.
-- `OUT OF SCALE` is advisory. It exits 0, and the `VERDICT` line names it, so a job that reads only
-  the exit code does not see it.
-- When the web map viewpoint records only an extent, which is the common shape, a filtered layer
-  that sets a range is `UNJUDGED` and the run exits 2. `--app-scale` is the way to get a verdict.
-  A map widget with a custom initial view has the same effect.
+- `OUT OF SCALE` is advisory and exits 0. Read the `VERDICT` line or the `--out` report. A job that
+  reads only the exit code does not see it.
+- A scale limit that is not a number, such as the string `"24000"`, is read as no limit.
+- A run that finds 0 references is vacuous. It does not prove that the app binds no layer, because
+  a widget can bind a layer through a key the tool does not list.
+- Exit 1 from `--self-test` means an assertion failed. It does not mean an app has findings.
+- A device or named pipe given as an input file can block the run. A very large input file is read
+  whole, because only the HTTP reads have a size cap.
+- A web map viewpoint can record only an extent. A filtered layer that sets a range is then
+  `UNJUDGED` and the run exits 2. The tool does not turn an extent into a scale, because the scale
+  depends on the window size, so give `--app-scale` for such a web map. A map widget with a custom
+  initial view has the same effect.
 - Only a reference whose path ends in `.filterItems[n].dataSource.dataSourceId` is checked for
   scale. A Table, Search or List widget on a hidden layer gets no finding. Esri does not document
   the keys that the Filter widget saves, so a Filter widget that stores its data source under

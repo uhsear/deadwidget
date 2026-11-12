@@ -4512,14 +4512,14 @@ def self_test():
         check(code == 64 and "ENVSECRET99" not in out + err and
               "--oops=***" in err, "and the environment token is redacted "
               "too  <-- pinned defect")
-        saved_io = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        saved_err = sys.stderr
+        sys.stderr = io.StringIO()
         try:
             raises(lambda: _Parser(prog="deadwidget.py").error(
                 "bad ENVSECRET99 value"), "a parser error exits", SystemExit)
             printed = sys.stderr.getvalue()
         finally:
-            sys.stdout, sys.stderr = saved_io
+            sys.stderr = saved_err
         check("bad " in printed and "ENVSECRET99" not in printed,
               "a parser error message is redacted of the environment token")
         code, out, err = run_cli([app_file, "--portal"])
