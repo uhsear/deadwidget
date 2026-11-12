@@ -66,24 +66,24 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-488 assertions, 0 failed
+490 assertions, 0 failed
 ```
 
-The full run prints all 488 assertions. The `...` line above is where this block is cut.
+The full run prints all 490 assertions. The `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 488 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
+The same 490 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
 `-W error`, and the two runs print identical output once the Windows carriage returns are removed.
-Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2747 statements, 756
+Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2753 statements, 760
 branches), measured on Windows with Python 3.13.2 and `coverage run --branch`, with no line
 excluded. `pyflakes` reports nothing on Windows.
 The Ubuntu host has neither `coverage` nor `pyflakes`. The file parses with
 `ast.parse(..., feature_version=(3, 9))`, and `-W error deadwidget.py --self-test` prints
-`488 assertions, 0 failed` on Windows with Python 3.9.25 as well.
+`490 assertions, 0 failed` on Windows with Python 3.9.16 as well.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -724,8 +724,8 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   noise, not a failure.
 - A redirect from an accepted host is followed to any `http` or `https` host when the run sends no
   token, which is the case for a `--trust-host` host read over plain `http` and for a run with no
-  token. The answer is parsed and never printed, but the request is still a blind GET that a
-  server's response drives.
+  token. The answer is parsed and never printed, but it decides the verdict for that service, and
+  the request is still a blind GET that a server's response drives.
 - Very deep JSON nesting can exhaust the recursion limit. The run then exits 2 with "could not
   complete".
 - A symbolic or hard link given as `--out`, or an input reached through a different link, can
@@ -736,8 +736,10 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 - `HTTP_TIMEOUT` applies to each socket operation, not to the whole request. The body size limit
   bounds the total bytes.
 - A `user:password@` in a service url, a data source url or a `--portal` url is dropped before the
-  tool prints it, writes it to the report. Such a url cannot
-  authenticate. The tool finds the userinfo up to the first `/` after `://`, so a password that
+  tool prints it or writes it to the report. Such a url cannot authenticate. A `--portal` url with
+  a `?` query or a `#` fragment is refused with exit 64, and the message does not quote it,
+  because a token inside it is not the `--token` value and so cannot be redacted. The self-test
+  pins this. The tool finds the userinfo up to the first `/` after `://`, so a password that
   holds a raw `/` is not recognised: encode it. A malformed `--service`, `--before` or
   `--layer-item` value is repeated in the usage error, so never put a credential or token in one.
 - The visibility `WARN` judges a top-level sublayer only. It rests on the web map specification's
@@ -771,6 +773,24 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 - A scale limit that is not a number, such as the string `"24000"`, is read as no limit.
 - A run that finds 0 references is vacuous. It does not prove that the app binds no layer, because
   a widget can bind a layer through a key the tool does not list.
+- Offline, a web map layer that names an item but no url gets no scale verdict, because there is
+  no service to read its range from. Esri web maps normally write a url for service layers, so
+  this is rare. Online the same layer is `UNJUDGED`.
+- A Filter bound straight to a service data source, with no web map layer, gets no scale verdict,
+  because the app has no map extent to test it against.
+- A web map `minScale` with no `--service` file for that layer is `UNJUDGED` and exits 2, not
+  `OUT OF SCALE`: the tool does not guess a range it cannot read.
+- A web map whose `layerType` is not a string makes the run exit 2 with "could not complete".
+- A path the tool cannot open is printed as typed. Do not paste a url that carries a token where a
+  file is expected.
+- A token inside the `--portal` url is refused. Give the token only through `DEADWIDGET_TOKEN` or
+  `--token`.
+- The token is sent in the query string, as the ArcGIS REST API allows, so a proxy or server log on
+  the way can record it.
+- A usage error that quotes a failed argument prints a `--token` value as typed. Only the
+  `DEADWIDGET_TOKEN` value is redacted there.
+- The self-test quoted above is an excerpt. It is cut at the `...` line, and the count matches the
+  full run.
 - Exit 1 from `--self-test` means an assertion failed. It does not mean an app has findings.
 - A device or named pipe given as an input file can block the run. A very large input file is read
   whole, because only the HTTP reads have a size cap.
@@ -832,8 +852,9 @@ MIT.
 Other single-file tools in this portfolio that pair with this one:
 
 - [sightline](https://github.com/uhsear/sightline) - audits web maps for layers their viewers
-  cannot see. Its README says that Experience Builder apps are not audited. This tool covers one
-  question about those apps: does each widget binding still resolve to a layer.
+  cannot see, and its `--edges` option reads Experience Builder apps to find the web maps they
+  embed. It does not read widget bindings or sublayer ids. This tool covers that finer question
+  inside one app: does each widget binding still resolve to a layer.
 - [whobreaks](https://github.com/uhsear/whobreaks) - finds every item in an organization that
   references an item you are about to delete, including inside Experience Builder configurations.
   It matches 32-character item ids. It does not look at the sublayer ids inside one app. Run

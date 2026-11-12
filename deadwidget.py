@@ -2474,9 +2474,16 @@ def main(argv=None, environ=None):
         if not ITEM_ID.match(args.item):
             return _usage("--item must be 32 hexadecimal characters")
         try:
-            host = urllib.parse.urlparse(args.portal).hostname or ""
+            parts = urllib.parse.urlparse(args.portal)
+            host = parts.hostname or ""
         except ValueError as exc:
             return _usage("--portal is not a valid url: %s" % exc)
+        if parts.query or parts.fragment:
+            # Refused, not stripped: the tool prints the portal url in
+            # messages, and a token in its query is not the --token value,
+            # so redact() cannot find it. The message does not quote it.
+            return _usage("--portal must not carry a ? query or a # "
+                          "fragment. Give the token through %s." % TOKEN_ENV)
         if token and args.portal.startswith("http://") \
                 and not is_loopback(host):
             return _usage("refusing to send a token to a plain http portal")
@@ -4672,6 +4679,13 @@ def self_test():
     code, out, err = run_cli(["--portal", "https://[x", "--item", app_id])
     check(code == 64 and "not a valid url" in err,
           "and so is one urllib cannot parse, before any request")
+    for tail in ("?token=PORTALTOK55", "#PORTALTOK55"):
+        code, out, err = run_cli(["--portal", "https://x/arcgis" + tail,
+                                  "--item", app_id])
+        check(code == 64 and "PORTALTOK55" not in out + err
+              and "DEADWIDGET_TOKEN" in err,
+              "a portal url with a query or fragment is refused without "
+              "quoting it  <-- pinned defect")
     check(run_cli(["--portal", "https://x", "--item", "abc"])[0] == 64,
           "a truncated item id is refused before any request")
     code, out, err = run_cli(["--portal", "http://gis.example.com", "--item",
