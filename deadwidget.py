@@ -148,6 +148,10 @@ CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 SERVICE_URL = re.compile(r"^(.*/(?:FeatureServer|MapServer))(?:/(\d+))?$",
                          re.IGNORECASE)
 
+# The scheme and the user:password@ of a url. The authority ends at the first
+# slash, so an @ in a path or query is not userinfo.
+USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@")
+
 ITEM_ID = re.compile(r"^[0-9a-fA-F]{32}$")
 
 OK = "OK"
@@ -225,6 +229,11 @@ class Published(frozenset):
 
     names = {}
     before = None
+    # ranges maps a layer id to the (minScale, maxScale) the service publishes
+    # for it, left out when it sets none. parent maps a layer id to its group
+    # sublayer's id.
+    ranges = {}
+    parent = {}
 
 
 # ---------------------------------------------------------- decision core
@@ -271,11 +280,25 @@ def service_root(url):
     """
     if not isinstance(url, str):
         return None, None
-    bare = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    bare = strip_userinfo(url).split("?", 1)[0].split("#", 1)[0].rstrip("/")
     match = SERVICE_URL.match(bare)
     if not match:
         return None, None
     return match.group(1), match.group(2)
+
+
+def hide_userinfo(text, url):
+    """text with the user:password of url, wherever it is quoted, as ***."""
+    match = USERINFO.match(url)
+    if match:
+        text = text.replace(match.group(0)[len(match.group(1)):-1], "***")
+    return text
+
+
+def strip_userinfo(url):
+    """url without a user:password@ in front of its host. Nothing prints or
+    reports a url with one, and urllib does not send it."""
+    return USERINFO.sub(r"\1", url)
 
 
 def service_ids(doc):
@@ -295,11 +318,16 @@ def service_ids(doc):
     ids = set()
     parent = {}
     names = {}
+    ranges = {}
     for key in ("layers", "tables"):
         entries = doc.get(key)
         for entry in entries if isinstance(entries, list) else []:
             if isinstance(entry, dict) and entry.get("id") is not None:
                 ids.add("%s" % (entry["id"],))
+                limits = ScaleRange((scale_value(entry.get("minScale")),
+                                     scale_value(entry.get("maxScale"))))
+                if any(limits):
+                    ranges["%s" % (entry["id"],)] = limits
                 if isinstance(entry.get("name"), str):
                     names["%s" % (entry["id"],)] = entry["name"]
                 if entry.get("parentLayerId") is not None:
@@ -322,6 +350,8 @@ def service_ids(doc):
                      "what a secured service returns to an anonymous read")
     out = Published(ids)
     out.names = names
+    out.ranges = ranges
+    out.parent = parent
     return out
 
 
@@ -388,13 +418,33 @@ def scale_value(value):
         value, bool) and 0 < value < float("inf") else 0
 
 
+class ScaleRange(tuple):
+    """(minScale, maxScale), 0 for none. explicit says, for each end, that the
+    web map wrote a number there, a 0 included: a written 0 may be an
+    override of the range the service publishes."""
+
+    explicit = (False, False)
+
+
+NO_RANGE = ScaleRange((0, 0))
+
+
+def scale_written(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and 0 <= value < float("inf")
+
+
 def scale_range(layer):
-    """(minScale, maxScale) of a web map layer or sublayer entry, 0 for none.
+    """The ScaleRange of a web map layer or sublayer entry.
     The value on the entry wins over the one in its layerDefinition."""
     ldef = layer.get("layerDefinition")
     ldef = ldef if isinstance(ldef, dict) else {}
-    return tuple(scale_value(layer.get(key)) or scale_value(ldef.get(key))
-                 for key in ("minScale", "maxScale"))
+    keys = ("minScale", "maxScale")
+    out = ScaleRange(scale_value(layer.get(key)) or scale_value(ldef.get(key))
+                     for key in keys)
+    out.explicit = tuple(scale_written(layer.get(key)) or
+                         scale_written(ldef.get(key)) for key in keys)
+    return out
 
 
 def sublayer_ranges(layer):
@@ -503,7 +553,7 @@ def index_webmap(doc):
     entries = {}
     mapsvc = {}
 
-    def add(layer, prefix, kind):
+    def add(layer, prefix, kind, groups=()):
         if not isinstance(layer, dict) or not layer.get("id"):
             return
         suffix = "%s%s" % (prefix, layer["id"])
@@ -514,11 +564,14 @@ def index_webmap(doc):
         if isinstance(layer.get("featureCollection"), dict):
             opaque = "feature collection"
         entries[suffix] = {"kind": kind, "title": title, "check": None,
-                           "opaque": opaque, "range": scale_range(layer)}
+                           "opaque": opaque, "range": scale_range(layer),
+                           "groups": groups}
         if ltype == "GroupLayer":
             children = layer.get("layers")
+            inside = groups + (("group layer '%s'" % title,
+                                entries[suffix]["range"]),)
             for child in children if isinstance(children, list) else []:
-                add(child, suffix + "-", "layer")
+                add(child, suffix + "-", "layer", inside)
         elif ltype in MAPSVC_TYPES:
             listed = overhaul(layer)
             item = layer.get("itemId")
@@ -528,7 +581,8 @@ def index_webmap(doc):
                               "item": item, "named": sublayer_names(layer),
                               "shown": _id_list(layer.get("visibleLayers")),
                               "range": scale_range(layer),
-                              "ranges": sublayer_ranges(layer)}
+                              "ranges": sublayer_ranges(layer),
+                              "groups": groups}
         elif index is not None:
             entries[suffix]["check"] = (root, index)
 
@@ -668,8 +722,77 @@ def layer_ranges(child, index):
         sid = child[len(best) + 1:].split("-")[-1]
         found = [("layer '%s'" % layer["title"], layer["range"]),
                  ("sublayer %s of '%s'" % (sid, layer["title"]),
-                  layer["ranges"].get(sid, (0, 0)))]
+                  layer["ranges"].get(sid, NO_RANGE))]
     return [(what, lo, hi) for what, (lo, hi) in found if lo or hi]
+
+
+def service_ranges(url, lid, written, services):
+    """([(what, lo, hi)], [(what, lo, hi, why)]) for the range the service
+    publishes for layer lid at url, and for the group sublayers above it.
+
+    The first list is firm: the web map writes no number for that end, so
+    the layer takes the service's range. The second is doubtful. It holds an
+    end where the web map writes 0, which may override the service, and a
+    group sublayer's range, which may or may not reach its children. Neither
+    is checked against the SDK (README, Limits). written is the web map's
+    ScaleRange for the layer.
+    """
+    got = services.get(url)
+    if not isinstance(got, Published):
+        return [], []
+    firm, doubt = [], []
+    mine = got.ranges.get(lid)
+    if mine:
+        sure = [0, 0]
+        unsure = [0, 0]
+        for end in (0, 1):
+            if mine[end] and not written[end]:
+                (unsure if written.explicit[end] else sure)[end] = mine[end]
+        what = "layer %s of the service at %s" % (lid, url)
+        if any(sure):
+            firm.append((what, sure[0], sure[1]))
+        if any(unsure):
+            doubt.append((what, unsure[0], unsure[1], "The web map writes 0 "
+                          "for that end, and whether 0 overrides the "
+                          "service's range is not checked"))
+    seen = [lid]
+    up = got.parent.get(lid)
+    while up in got and up not in seen:
+        seen.append(up)
+        if got.ranges.get(up):
+            doubt.append(("group sublayer %s of the service at %s" % (up, url),
+                          got.ranges[up][0], got.ranges[up][1],
+                          "Whether a group sublayer's range reaches its "
+                          "children is not checked"))
+        up = got.parent.get(up)
+    return firm, doubt
+
+
+def inherited_ranges(child, index, services):
+    """(firm, doubtful) ranges that can hide a web map layer or sublayer and
+    are not written on it: the ones its service publishes, and the ones on the
+    group layers and group sublayers above it. See service_ranges."""
+    entries, mapsvc = index
+    entry = entries.get(child)
+    if entry is not None:
+        firm, doubt = [], []
+        if entry["check"]:
+            firm, doubt = service_ranges(entry["check"][0], entry["check"][1],
+                                         entry["range"], services)
+        groups = entry["groups"]
+    else:
+        best = map_service_of(child, mapsvc)
+        layer = mapsvc[best]
+        sid = child[len(best) + 1:].split("-")[-1]
+        firm, doubt = service_ranges(layer["url"], sid,
+                                     layer["ranges"].get(sid, NO_RANGE),
+                                     services)
+        groups = layer["groups"]
+    for what, (lo, hi) in groups:
+        if lo or hi:
+            doubt.append((what, lo, hi, "Whether a group layer's range "
+                          "reaches its children is not checked"))
+    return firm, doubt
 
 
 def custom_view(app):
@@ -700,23 +823,26 @@ def app_scale(app, index, override):
                "size")
 
 
-def scale_check(dsid, app, webmaps, override):
+def scale_check(dsid, app, webmaps, override, services=None):
     """For a filter's data source that resolved: HIDDEN when a scale range
     hides the layer at the app's scale, UNJUDGED when a range is set and the
-    scale is not known, else None. Only a web map layer carries the range."""
+    scale is not known, or when only a range that may not apply hides it,
+    else None. The range comes from the web map, from the service it draws
+    (services, when that was read), and from the groups above the layer."""
     datasources = app["dataSources"]
     root, child = split_root(dsid, datasources)
     if child is None or datasources[root].get("type") != "WEB_MAP":
         return None
     index = webmaps[datasources[root]["itemId"]]
-    ranges = layer_ranges(child, index)
-    if not ranges:
+    firm, doubt = inherited_ranges(child, index, services or {})
+    ranges = layer_ranges(child, index) + firm
+    if not (ranges or doubt):
         return None
     scale, source = app_scale(app, index, override)
     if not scale:
         return Verdict(UNJUDGED, "%s sets a scale range, and the scale the "
                        "app opens at is not known: %s. Give --app-scale"
-                       % (ranges[0][0], source))
+                       % ((ranges or doubt)[0][0], source))
     for what, lo, hi in ranges:
         if lo and scale > lo:
             return Verdict(HIDDEN, "%s is not drawn at 1:%.0f (%s), because "
@@ -728,6 +854,15 @@ def scale_check(dsid, app, webmaps, override):
                            "its maximum scale is 1:%.0f. A filter on it "
                            "changes nothing a user can see until they zoom "
                            "out" % (what, scale, source, hi))
+    for what, lo, hi, why in doubt:
+        if (lo and scale > lo) or (hi and scale < hi):
+            limits = " and ".join(
+                text % value for text, value in (
+                    ("a minimum scale of 1:%.0f", lo),
+                    ("a maximum scale of 1:%.0f", hi)) if value)
+            return Verdict(UNJUDGED, "%s has %s, which would hide the layer "
+                           "at 1:%.0f (%s). %s. Look at the app at that "
+                           "scale" % (what, limits, scale, source, why))
     return None
 
 
@@ -915,7 +1050,7 @@ def signature(app):
         url = ds.get("url")
         # The query string is dropped: a stored layer url can carry a token,
         # which must not be printed, and a rotated token is not a change.
-        url = url.split("?", 1)[0] if isinstance(url, str) else ""
+        url = strip_userinfo(url).split("?", 1)[0]             if isinstance(url, str) else ""
         sig.add("dataSources.%s = %s %s %s" % (
             key, ds.get("type") or "", ds.get("itemId") or "", url))
     return sig
@@ -1017,7 +1152,7 @@ def audit(surfaces, webmap_get, service_get, item_get, before=None,
     for name, ref, verdict in verdicts:
         if ref.filtered and verdict.status == OK:
             verdict = scale_check(ref.dsid, by_name[name], webmaps,
-                                  scale) or verdict
+                                  scale, services) or verdict
         if verdict.status == DANGLING and ref.inert:
             verdict = Verdict(INERT, "%s. %s" % (verdict.reason, ref.inert))
         elif verdict.status == WARN and ref.inert:
@@ -1833,12 +1968,14 @@ def http_json(url, token=None, referer=None, bust=False,
     params = {"f": "json"}
     if token:
         params["token"] = token
+    # A message names the url without its user:password@.
+    shown = strip_userinfo(url)
     if bust:
         # The draft resource is cached. A read without a junk parameter
         # can return the copy from before the last save.
         params["_ts"] = "%d" % (time.time() * 1000)
     if urllib.parse.urlsplit(url).scheme.lower() not in WEB_SCHEMES:
-        raise Unread(redact("%s: only http and https urls are fetched" % url,
+        raise Unread(redact("%s: only http and https urls are fetched" % shown,
                             token))
     try:
         # Built inside the try: urllib refuses some urls here, and its
@@ -1858,14 +1995,15 @@ def http_json(url, token=None, referer=None, bust=False,
     except Exception as exc:
         # Deliberately broad: a refused socket, a timeout, an HTTP 500 and a
         # TLS failure all mean the same thing here, this input is unread.
-        raise Unread(redact("%s: %s" % (url, exc), token))
+        raise Unread(redact(hide_userinfo("%s: %s" % (shown, exc), url),
+                            token))
     if len(raw) > limit:
-        raise Unread("%s: larger than %d bytes, not read" % (url, limit))
+        raise Unread("%s: larger than %d bytes, not read" % (shown, limit))
     try:
         text = raw.decode("utf-8-sig")
         return json.loads(text) if text.strip() else None
     except (ValueError, RecursionError):
-        raise Unread("%s: the response is not JSON" % url)
+        raise Unread("%s: the response is not JSON" % shown)
 
 
 class WebOnlyRedirect(urllib.request.HTTPRedirectHandler):
@@ -2182,7 +2320,7 @@ def _fetcher(args, token):
     """get(url) for online mode: only accepted hosts, the token only where it
     may go. Returns (get, sharing/rest url, referer)."""
     rest = rest_root(args.portal)
-    referer = args.portal.rstrip("/")
+    referer = strip_userinfo(args.portal).rstrip("/")
     trusted = set(host.lower() for host in args.trust_host)
 
     def token_ok(url):
@@ -2764,7 +2902,7 @@ def self_test():
         {"id": "G", "layerType": "GroupLayer", "layers": 7}],
         "tables": 5})[0] == {"G": {"kind": "layer", "title": "G",
                                    "check": None, "opaque": None,
-                                   "range": (0, 0)}},
+                                   "range": (0, 0), "groups": ()}},
           "a group's layers and a tables key that are not lists are ignored")
 
     # ---- a layers array with scale ranges is exclusive, one without is
@@ -3809,8 +3947,17 @@ def self_test():
     check(verdict.status == HIDDEN and "layer 'Streets'" in verdict.reason
           and scaled("R2-1", 8000)[0].status == OK,
           "the range of the map service layer hides every sublayer of it")
-    check(scaled("G1-G1C", 100000)[0].status == OK,
-          "a range on a group layer is not applied to its children (Limits)")
+    verdict, report = scaled("G1-G1C", 100000)
+    check(verdict.status == UNJUDGED and exit_code(report) == 2 and
+          "group layer 'Land'" in verdict.reason and
+          "minimum scale of 1:24000" in verdict.reason and
+          "maximum" not in verdict.reason and
+          "reaches its children is not checked" in verdict.reason and
+          scaled("G1-G1C", 24000)[0].status == OK and
+          scaled("G1-G1C", 0)[0].status == UNJUDGED,
+          "a range on a group layer that would hide a child is UNJUDGED, "
+          "exit 2, never a clean OK; a child it cannot hide is OK  "
+          "<-- pinned defect")
     near = copy(scale_wm)
     near["initialState"]["viewpoint"]["scale"] = 12000
     check(scaled("P1", 0, near)[0].status == OK and
@@ -3895,6 +4042,130 @@ def self_test():
           == {"3": (9, 0)} and sublayer_ranges({"layers": 5}) == {},
           "a sublayer entry that is no object, or has no id, is skipped")
 
+    # ---- a range the service publishes, and one on a group above the layer
+    plain_s = sbase + "/Land/Plain/MapServer"
+    pub_wm = {"operationalLayers": [
+        {"id": "S1", "layerType": "ArcGISFeatureLayer", "title": "Lots",
+         "url": parcels + "/0"},
+        {"id": "S2", "layerType": "ArcGISFeatureLayer", "title": "Zeroed",
+         "url": parcels + "/0", "minScale": 0},
+        {"id": "S3", "layerType": "ArcGISFeatureLayer", "title": "Own",
+         "url": parcels + "/0", "minScale": 50000},
+        {"id": "S4", "layerType": "ArcGISFeatureLayer", "title": "Deep",
+         "url": wells + "/0"},
+        {"id": "S5", "layerType": "ArcGISFeatureLayer", "title": "Both",
+         "url": parcels + "/0", "layerDefinition": {"maxScale": 0}},
+        {"id": "M1", "layerType": "ArcGISMapServiceLayer", "title": "Roads",
+         "url": roads_s, "layers": [{"id": 0}, {"id": 1}, {"id": 2},
+                                    {"id": 3}]},
+        {"id": "G2", "layerType": "GroupLayer", "title": "Outer",
+         "minScale": 24000, "layers": [
+             {"id": "G3", "layerType": "GroupLayer", "title": "Inner",
+              "layers": [
+                  {"id": "M3", "layerType": "ArcGISMapServiceLayer",
+                   "title": "Nested", "url": plain_s,
+                   "layers": [{"id": 2}]}]}]}],
+        "initialState": {"viewpoint": {"scale": 100000}}}
+    pub_svc = {
+        plain_s: {"layers": [{"id": 2}]},
+        parcels: {"layers": [{"id": 0, "minScale": 24000}]},
+        wells: {"layers": [{"id": 0, "maxScale": 5000}]},
+        roads_s: {"layers": [{"id": 0, "minScale": 10000},
+                             {"id": 1, "parentLayerId": 0},
+                             {"id": 2, "parentLayerId": 1},
+                             {"id": 3, "parentLayerId": 3}]}}
+
+    def published(dsid, scale=100000):
+        got = run(filter_app(dsid), pub_wm, pub_svc, scale=scale)
+        return [v for _, r, v in got.findings if r.filtered][0], got
+
+    verdict, report = published("S1")
+    check(verdict.status == HIDDEN and exit_code(report) == 0 and
+          "layer 0 of the service at " + parcels in verdict.reason and
+          "minimum scale is 1:24000" in verdict.reason and
+          published("S1", 24000)[0].status == OK,
+          "a filter on a layer that the web map gives no range, and whose "
+          "service publishes a minimum scale, is OUT OF SCALE  "
+          "<-- pinned defect")
+    verdict, _ = published("S4", 3000)
+    check(verdict.status == HIDDEN and "maximum scale is 1:5000" in
+          verdict.reason and published("S4", 5000)[0].status == OK,
+          "and so is one hidden by the maximum scale its service publishes")
+    verdict, _ = published("S2")
+    check(verdict.status == UNJUDGED and "writes 0 for that end" in
+          verdict.reason and published("S2", 24000)[0].status == OK,
+          "a web map that writes 0 where its service publishes a limit is "
+          "UNJUDGED, because a 0 may override the service  <-- pinned defect")
+    check(published("S3", 40000)[0].status == OK and
+          published("S3")[0].status == HIDDEN and
+          "layer 'Own'" in published("S3")[0].reason,
+          "a nonzero range in the web map replaces the service's")
+    check(published("S5")[0].status == HIDDEN,
+          "a written 0 at one end does not hide the other end's service "
+          "range")
+    verdict, _ = published("M1-0", 50000)
+    check(verdict.status == HIDDEN and "layer 0 of the service at " + roads_s
+          in verdict.reason, "a map service sublayer takes the range its "
+          "service publishes")
+    verdict, report = published("M1-2", 50000)
+    check(verdict.status == UNJUDGED and exit_code(report) == 2 and
+          "group sublayer 1" not in verdict.reason and
+          "group sublayer 0 of the service" in verdict.reason and
+          "a group sublayer's range reaches its children" in verdict.reason
+          and published("M1-2", 10000)[0].status == OK and
+          published("M1-1", 50000)[0].status == UNJUDGED,
+          "a range on a group sublayer above the layer is UNJUDGED, not "
+          "OK: the walk up the service's groups ends at a loop  "
+          "<-- pinned defect")
+    verdict, _ = published("G2-G3-M3-2", 100000)
+    check(verdict.status == UNJUDGED and "group layer 'Outer'" in
+          verdict.reason and published("G2-G3-M3-2", 24000)[0].status == OK
+          and published("G2-G3-M3-2", 30000)[0].status == UNJUDGED,
+          "a range on a group layer two levels up is UNJUDGED")
+    check(published("M1-3", 50000)[0].status == OK,
+          "a layer that is its own parent in the service ends the walk up "
+          "the groups")
+    unknown = copy(pub_wm)
+    unknown["initialState"] = {}
+    got = run(filter_app("G2-G3-M3-2"), unknown, pub_svc)
+    check([v.status for _, r, v in got.findings if r.filtered] == [UNJUDGED]
+          and "Give --app-scale" in [v for _, r, v in got.findings
+                                     if r.filtered][0].reason,
+          "a child with only a doubtful range and an unknown app scale is "
+          "UNJUDGED and asks for --app-scale")
+    got = run(filter_app("S1"), pub_wm, {parcels: {"layers": [{"id": 1}]}},
+              scale=100000)
+    check([v.status for _, r, v in got.findings if r.filtered] == [DANGLING],
+          "a layer the service dropped is DANGLING, and gets no scale "
+          "verdict")
+    got = run(filter_app("S1"), pub_wm, {}, scale=100000)
+    check([v.status for _, r, v in got.findings if r.filtered] == [UNJUDGED]
+          and exit_code(got) == 2, "a service that was not read leaves the "
+          "filter UNJUDGED, as it did before")
+    check(service_ids({"layers": [
+        {"id": 0, "minScale": 9, "maxScale": 3}, {"id": 1, "minScale": "x",
+                                                  "maxScale": -1},
+        {"id": 2, "minScale": 0}, {"id": 3, "minScale": 7,
+                                   "parentLayerId": 0}]}).ranges
+          == {"0": (9, 3), "3": (7, 0)} and
+          service_ids({"layers": [{"id": 3, "parentLayerId": 0},
+                                  {"id": 0}]}).parent == {"3": "0"},
+          "a service's ranges and parents are read, and junk is no range")
+    check(service_ranges(parcels, "0", NO_RANGE, {}) == ([], []) and
+          service_ranges(parcels, "0", NO_RANGE, {parcels: "boom"})
+          == ([], []) and scaled("G1", 100000)[0].status == HIDDEN,
+          "a service that was not read adds no range, and a filter on a "
+          "group layer itself, which has no service, is judged by its own "
+          "range")
+    check(scale_range({"minScale": 0, "maxScale": 5}).explicit
+          == (True, True) and
+          scale_range({"layerDefinition": {"minScale": 0}}).explicit
+          == (True, False) and
+          scale_range({"minScale": True, "maxScale": -1}).explicit
+          == (False, False) and
+          scale_range({"minScale": float("nan")}).explicit == (False, False),
+          "a number written in the web map, 0 included, is explicit")
+
     # ---- small helpers
     check(same_name(u"Caf\u00e9", u" caf\u00e9 ") and
           not same_name(u"Caf\u00e9", u"Cafe\u0301"),
@@ -3909,6 +4180,18 @@ def self_test():
           service_root("https://h/a/MapServer/3#f") ==
           ("https://h/a/MapServer", "3"), "a layer url splits into service "
           "and index, without its query string or fragment")
+    check(service_root("https://u:pw@h/a/MapServer/3?x=1") ==
+          ("https://h/a/MapServer", "3") and
+          service_root("https://u:p@w@h/a/MapServer") ==
+          ("https://h/a/MapServer", None) and
+          service_root("https://h/a/MapServer?e=a@b") ==
+          ("https://h/a/MapServer", None) and
+          service_root("https://h/a/b@c/MapServer")[0] ==
+          "https://h/a/b@c/MapServer" and
+          hide_userinfo("x u:pw y", "https://u:pw@h/") == "x *** y" and
+          hide_userinfo("x u:pw y", "https://h/") == "x u:pw y",
+          "a user:password in a service url is dropped from the key  "
+          "<-- pinned defect")
     check(service_root(None) == (None, None) and
           service_root("https://h/a/ImageServer") == (None, None),
           "a url that is not a map or feature service is not a service")
@@ -4342,6 +4625,43 @@ def self_test():
               "error that does not echo the token  <-- pinned defect" % flag)
     check(run_cli([sc_app, "--dashboard", "--app-scale", "24000"])[0] == 64,
           "--app-scale is refused for a dashboard")
+    secret_svc = "https://svcuser:SECRETPW99@gis.example.com/s/Wells/MapServer"
+    cred_app = {"widgets": {"widget_1": {"label": "Map", "useDataSources": [
+        {"dataSourceId": "dataSource_1"}]}, "widget_2": {"label": "Lookup",
+        "useDataSources": [{"dataSourceId": "dataSource_2-1"}]}},
+        "dataSources": {"dataSource_1": {"type": "WEB_MAP",
+                                         "itemId": wm_id},
+                        "dataSource_2": {"type": "MAP_SERVICE",
+                                         "url": secret_svc + "/1"}}}
+    cred_wm = {"operationalLayers": [
+        {"id": "W1", "layerType": "ArcGISMapServiceLayer", "title": "Wells",
+         "url": secret_svc, "layers": [{"id": 1, "name": "Wells 1"}]}]}
+    cred_out = os.path.join(tmp, "cred_report.json")
+    code, out, err = run_cli([put("cred_app.json", cred_app), "--webmap",
+                              put("cred_wm.json", cred_wm), "--out", cred_out,
+                              "--apply"])
+    check(code == 2 and "could not be read" in out and
+          "https://gis.example.com/s/Wells/MapServer" in out and
+          "SECRETPW99" not in out + err + json.dumps(read_json_file(cred_out)) and
+          not [x for x in signature(cred_app) if "SECRETPW99" in x],
+          "a user:password in a service url reaches neither the output, "
+          "the report nor a drift line  <-- pinned defect")
+    code, out, err = run_cli(["--portal", "http://svcuser:SECRETPW99@127.0.0.1:1/"
+                              "portal", "--item", "a" * 32, "--out",
+                              cred_out, "--apply"])
+    check(code == 2 and "http://127.0.0.1:1/portal item" in
+          json.dumps(read_json_file(cred_out)) and
+          "SECRETPW99" not in out + err + json.dumps(read_json_file(cred_out)),
+          "a user:password in a --portal url reaches neither the output nor "
+          "the report's source  <-- pinned defect")
+    exc = raises(lambda: http_json("ftp://svcuser:SECRETPW99@h/x"),
+                 "a url that is not http is unread", Unread)
+    check("SECRETPW99" not in "%s" % exc and "ftp://h/x" in "%s" % exc,
+          "and its message names the url without the user:password")
+    exc = raises(lambda: http_json("http://svcuser:SECRETPW99@127.0.0.1:1/x"),
+                 "a refused connection is unread", Unread)
+    check("SECRETPW99" not in "%s" % exc,
+          "and a connection error does not repeat the user:password")
     check(run_cli([app_file, "--bogus"])[0] == 64,
           "an unknown flag exits 64, not argparse's 2  <-- pinned defect")
     code, out, err = run_cli(["--portal", "https://x"])
@@ -5169,6 +5489,27 @@ def self_test():
         code, out, err = run_cli(trusting)
         check(code == 0, "online: an empty body, which is what the portal "
               "returns for an item with no data, leaves the service to decide")
+        reset()
+        on_parcels = live + "/server/rest/services/Land/Parcels/FeatureServer"
+        on_wm = {"operationalLayers": [
+            {"id": "P1", "layerType": "ArcGISFeatureLayer", "title": "Parcels",
+             "url": on_parcels + "/0"}],
+            "initialState": {"viewpoint": {"targetGeometry": {"xmin": 0}}}}
+        for path in ("/data", "/resources/config/config.json"):
+            routes[rest + app_id + path] = (200, filter_app("P1"))
+        routes[rest + wm_id + "/data"] = (200, on_wm)
+        routes[urllib.parse.urlsplit(on_parcels).path] = (
+            200, {"layers": [{"id": 0, "minScale": 24000}]})
+        code, out, err = run_cli(online + ["--token", token, "--app-scale",
+                                           "100000"])
+        check(code == 0 and "OUT OF SCALE" in out and "(--app-scale)" in out
+              and "layer 0 of the service at " + on_parcels in out,
+              "online: the scale check runs over the loopback stub, reads "
+              "the range the service publishes, and takes --app-scale")
+        code, out, err = run_cli(online + ["--token", token])
+        check(code == 2 and "Give --app-scale" in out,
+              "online: an extent-only web map is UNJUDGED without "
+              "--app-scale")
         reset()
         bad_app = copy(o_app)
         bad_app["dataSources"]["dataSource_1"]["itemId"] = "../../etc"
