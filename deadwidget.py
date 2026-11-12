@@ -291,7 +291,12 @@ def hide_userinfo(text, url):
     """text with the user:password of url, wherever it is quoted, as ***."""
     match = USERINFO.match(url)
     if match:
-        text = text.replace(match.group(0)[len(match.group(1)):-1], "***")
+        userinfo = match.group(0)[len(match.group(1)):-1]
+        text = text.replace(userinfo, "***")
+        # urllib quotes the password alone in "nonnumeric port: 'PW@host'".
+        password = userinfo.partition(":")[2]
+        if password:
+            text = text.replace(password, "***")
     return text
 
 
@@ -1573,6 +1578,10 @@ def chart_rules(widget, grouped, returns, flag):
         return
     if ctype not in ("groupByValues", "features"):
         return
+    if any(part and not isinstance(part, dict) for part in (category, split)):
+        # Esri publishes no schema, so a bare string is not read as a field.
+        flag("", NOT_AUDITED, "its category or split is not an object with "
+             "a fieldName, so the field is not checked")
     for role, name in names:
         if name.lower() not in returns:
             flag("series-unbound", BROKEN, "its %s field '%s' is not "
@@ -1962,8 +1971,9 @@ def http_json(url, token=None, referer=None, bust=False,
               limit=MAX_BODY_BYTES, timeout=HTTP_TIMEOUT, redirect_ok=None):
     """GET url?f=json and parse it. Any failure is Unread, token redacted.
 
-    With a token, a redirect is followed only to a url redirect_ok accepts:
-    the Location of a redirect usually keeps the query, token included.
+    A redirect is followed only to a url redirect_ok accepts, when given:
+    the Location of a redirect usually keeps the query, token included, and
+    a service must not send a run to a host it does not read.
     """
     params = {"f": "json"}
     if token:
@@ -1981,13 +1991,15 @@ def http_json(url, token=None, referer=None, bust=False,
         # Built inside the try: urllib refuses some urls here, and its
         # message quotes the whole url, token included.
         request = urllib.request.Request(
-            "%s?%s" % (url, urllib.parse.urlencode(params)))
+            "%s?%s" % (shown, urllib.parse.urlencode(params)))
         if referer:
             request.add_header("Referer", referer)
         if bust:
             request.add_header("Cache-Control", "no-cache")
         response = urllib.request.build_opener(WebOnlyRedirect(
-            redirect_ok if token else None)).open(request, timeout=timeout)
+            redirect_ok, "a host the token may not go to" if token
+            else "a host this run does not read")).open(
+                request, timeout=timeout)
         try:
             raw = response.read(limit + 1)
         finally:
@@ -2011,16 +2023,18 @@ class WebOnlyRedirect(urllib.request.HTTPRedirectHandler):
     the tool anywhere that http_json would refuse to go directly, nor carry
     the token to a host that sends_token refuses."""
 
-    def __init__(self, token_ok=None):
+    def __init__(self, token_ok=None,
+                 host_note="a host the token may not go to"):
         urllib.request.HTTPRedirectHandler.__init__(self)
         self.token_ok = token_ok
+        self.host_note = host_note
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         refused = None
         if urllib.parse.urlsplit(newurl).scheme.lower() not in WEB_SCHEMES:
             refused = "a url that is not http or https"
         elif self.token_ok and not self.token_ok(newurl):
-            refused = "a host the token may not go to"
+            refused = self.host_note
         if refused:
             # Closed here: urllib leaves the refused response open.
             fp.close()
@@ -2326,12 +2340,16 @@ def _fetcher(args, token):
     def token_ok(url):
         return sends_token(url, args.portal, trusted)
 
+    def host_ok(url):
+        return reads_host(url, args.portal, trusted)
+
     def get(url, bust=False):
         if not reads_host(url, args.portal, trusted):
             raise Unread("not on the portal's host or a host named with "
                          "--trust-host, so it was not fetched")
         secret = token if token and token_ok(url) else None
-        return http_json(url, secret, referer, bust, redirect_ok=token_ok)
+        return http_json(url, secret, referer, bust,
+                         redirect_ok=token_ok if secret else host_ok)
     return get, rest, referer
 
 
@@ -4661,6 +4679,13 @@ def self_test():
           "SECRETPW99" not in out + err + json.dumps(read_json_file(cred_out)),
           "a user:password in a --portal url reaches neither the output nor "
           "the report's source  <-- pinned defect")
+    code, out, err = run_cli(["--portal", "https://svcuser:SECRETPW99@"
+                              "org.example.com", "--item", "a" * 32, "--out",
+                              cred_out, "--apply"])
+    check(code == 2 and "SECRETPW99" not in out + err + json.dumps(
+        read_json_file(cred_out)),
+          "a user:password in a --portal url with no port is not quoted by "
+          "urllib's error either  <-- pinned defect")
     exc = raises(lambda: http_json("ftp://svcuser:SECRETPW99@h/x"),
                  "a url that is not http is unread", Unread)
     check("SECRETPW99" not in "%s" % exc and "ftp://h/x" in "%s" % exc,
@@ -4956,6 +4981,13 @@ def self_test():
           == [(BROKEN, "series-unbound")],
           "series-unbound: a grouped chart's category, split or value that "
           "its query does not return is BROKEN")
+    check(mutate(lambda d: w(d, 1).update(category="crew_name")) ==
+          [(NOT_AUDITED, "")] and
+          mutate(lambda d: w(d, 1).update(splitBy=["crew_name"])) ==
+          [(NOT_AUDITED, "")] and
+          mutate(lambda d: w(d, 1).update(splitBy="")) == [],
+          "series-unbound: a category or split that is not an object is "
+          "NOT AUDITED, not a clean read  <-- pinned defect")
     check(mutate(lambda d: w(d, 1).update(categoryType="features")) ==
           [(BROKEN, "series-unbound")],
           "and a features chart whose query groups its rows is BROKEN")
@@ -5610,7 +5642,17 @@ def self_test():
         code, out, err = run_cli(trusting)
         check(code == 0 and [s for s in seen if s[0].startswith("localhost")
                              and s[1].endswith("Water/MapServer")],
-              "online: and a read with no token follows the redirect")
+              "online: and a read with no token follows the redirect to a "
+              "trusted host")
+        relayed()
+        seen_before = len(seen)
+        code, out, err = run_cli(online)
+        check(code == 2 and "a redirect to a host this run does not read "
+              "was refused" in out and not [
+                  s for s in seen[seen_before:]
+                  if s[0].startswith("localhost")],
+              "online: but not to a host it does not read  "
+              "<-- pinned defect")
         reset()
         hostile = copy(o_wm)
         hostile["operationalLayers"][1]["url"] = (
