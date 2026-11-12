@@ -66,24 +66,24 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-490 assertions, 0 failed
+493 assertions, 0 failed
 ```
 
-The full run prints all 490 assertions. The `...` line above is where this block is cut.
+The full run prints all 493 assertions. The `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 490 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
+The same 493 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
 `-W error`, and the two runs print identical output once the Windows carriage returns are removed.
-Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2753 statements, 760
+Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2769 statements, 764
 branches), measured on Windows with Python 3.13.2 and `coverage run --branch`, with no line
 excluded. `pyflakes` reports nothing on Windows.
 The Ubuntu host has neither `coverage` nor `pyflakes`. The file parses with
 `ast.parse(..., feature_version=(3, 9))`, and `-W error deadwidget.py --self-test` prints
-`490 assertions, 0 failed` on Windows with Python 3.9.16 as well.
+`493 assertions, 0 failed` on Windows with Python 3.9.25 as well.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -347,6 +347,33 @@ tool checks only a filter: a reference whose path ends in
 saves, and the keys of a custom initial view are not documented either. Check both against your own
 app.
 
+The runs below use these synthetic files. This script writes all of them into the current
+folder, so a reader can rebuild each run. The four-file rule keeps the files themselves out of
+the repo.
+
+```
+import json
+U="https://gis.example.com/server/rest/services/Land/Parcels/FeatureServer"
+def app(dsid):
+    return {"widgets":{
+     "widget_1":{"label":"Map","useDataSources":[{"dataSourceId":"dataSource_1"}],"config":{}},
+     "widget_2":{"label":"Parcel filter","config":{"filterItems":[{"dataSource":{"dataSourceId":dsid}}]}}},
+     "dataSources":{"dataSource_1":{"type":"WEB_MAP","itemId":"abc123"}}}
+def wm(layer, vp):
+    return {"operationalLayers":[layer],"initialState":{"viewpoint":vp}}
+lay={"id":"18f00000001-layer-4","layerType":"ArcGISFeatureLayer","title":"Parcels","url":U+"/0"}
+json.dump(app("dataSource_1-18f00000001-layer-4"),open("app.json","w"))
+json.dump(wm(dict(lay,minScale=24000),{"scale":100000}),open("webmap.json","w"))
+json.dump(wm(dict(lay,minScale=24000),{"targetGeometry":{"xmin":0,"ymin":0,"xmax":1,"ymax":1}}),open("webmap_extent.json","w"))
+json.dump(wm(dict(lay),{"scale":100000}),open("webmap_plain.json","w"))
+json.dump(wm(dict(lay,minScale=0),{"scale":100000}),open("webmap_zero.json","w"))
+json.dump({"layers":[{"id":0,"name":"Parcels","minScale":24000,"maxScale":0}]},open("parcels_ranged.json","w"))
+json.dump({"layers":[{"id":0,"name":"Parcels"}]},open("parcels.json","w"))
+g={"id":"18f00000009-layer-1","layerType":"GroupLayer","title":"Land","minScale":24000,"layers":[dict(lay)]}
+json.dump(app("dataSource_1-18f00000009-layer-1-18f00000001-layer-4"),open("app_group.json","w"))
+json.dump(wm(g,{"scale":100000}),open("webmap_group.json","w"))
+```
+
 This run reads a synthetic app with one Filter widget, bound to a layer `Parcels` with `minScale`
 24000 in the web map. The web map opens at 1:100000.
 
@@ -359,8 +386,6 @@ OUT OF SCALE dataSource_1-18f00000001-layer-4
              widget_2 (Parcel filter), in the published copy
              layer 'Parcels' is not drawn at 1:100000 (the web map's initial viewpoint), because its minimum scale is 1:24000. A filter on it changes nothing a user can see until they zoom in
              at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
-
-NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
 
 references: 2 found, 1 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 1 out of scale
 VERDICT: every data source reference resolves. 1 filter binding(s) act on a layer that its scale range hides when the app opens: see OUT OF SCALE.
@@ -379,8 +404,6 @@ UNJUDGED     dataSource_1-18f00000001-layer-4
              layer 'Parcels' sets a scale range, and the scale the app opens at is not known: the web map's initial viewpoint records an extent or nothing, and an extent gives a scale only for a known window size. Give --app-scale
              at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
 
-NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
-
 references: 2 found, 1 ok, 0 dangling, 1 unjudged, 0 inert, 0 not audited
 VERDICT: INCOMPLETE. Something could not be read, so this run proves nothing about it.
 (exit 2)
@@ -393,7 +416,7 @@ $ same command with webmap_extent.json and --app-scale 12000
 deadwidget: published copy, 2 widget(s), 2 data source reference(s)
 web maps read: 1 of 1, services read: 1 of 1
 
-NOTE         2 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
+NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
 
 references: 2 found, 2 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited
 VERDICT: every data source reference resolves.
@@ -414,8 +437,6 @@ OUT OF SCALE dataSource_1-18f00000001-layer-4
              layer 0 of the service at https://gis.example.com/server/rest/services/Land/Parcels/FeatureServer is not drawn at 1:100000 (the web map's initial viewpoint), because its minimum scale is 1:24000. A filter on it changes nothing a user can see until they zoom in
              at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
 
-NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
-
 references: 2 found, 1 ok, 0 dangling, 0 unjudged, 0 inert, 0 not audited, 1 out of scale
 VERDICT: every data source reference resolves. 1 filter binding(s) act on a layer that its scale range hides when the app opens: see OUT OF SCALE.
 (exit 0)
@@ -434,8 +455,6 @@ UNJUDGED     dataSource_1-18f00000001-layer-4
              layer 0 of the service at https://gis.example.com/server/rest/services/Land/Parcels/FeatureServer has a minimum scale of 1:24000, which would hide the layer at 1:100000 (the web map's initial viewpoint). The web map writes 0 for that end, and whether 0 overrides the service's range is not checked. Look at the app at that scale
              at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
 
-NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
-
 references: 2 found, 1 ok, 0 dangling, 1 unjudged, 0 inert, 0 not audited
 VERDICT: INCOMPLETE. Something could not be read, so this run proves nothing about it.
 (exit 2)
@@ -452,8 +471,6 @@ UNJUDGED     dataSource_1-18f00000009-layer-1-18f00000001-layer-4
              widget_2 (Parcel filter), in the published copy
              group layer 'Land' has a minimum scale of 1:24000, which would hide the layer at 1:100000 (the web map's initial viewpoint). Whether a group layer's range reaches its children is not checked. Look at the app at that scale
              at widgets.widget_2.config.filterItems[0].dataSource.dataSourceId
-
-NOTE         1 reference(s) to a service layer were checked by id only: no recorded name was there to compare, so a renumber would read ok. Give --before, or a web map that records sublayer names.
 
 references: 2 found, 1 ok, 0 dangling, 1 unjudged, 0 inert, 0 not audited
 VERDICT: INCOMPLETE. Something could not be read, so this run proves nothing about it.
@@ -607,9 +624,10 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   print the answer. A service on any other host is not read. Its references are `UNJUDGED`, the
   reason names `--trust-host`, and the run exits 2. The self-test pins that no request reaches
   such a host.
-- A host is matched by name, not by port. A redirect from an accepted host is followed to another
-  `http` or `https` url. A redirect that would carry the token is followed only to an accepted
-  host.
+- A host is matched by name, not by port, so every port on an accepted host receives the token. A
+  redirect is followed only to a host the run would read directly. A redirect that would carry the
+  token is followed only to a host that may receive it, over `https` or to the loopback address.
+  The self-test pins both refusals.
 - The token goes to the same hosts, so a public service on another host, such as an Esri Living
   Atlas layer under an Enterprise portal, is audited only when you trust that host with the token
   too. Offline mode, with `--service URL=FILE`, audits it without the token.
@@ -722,10 +740,6 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   URL-safe.
 - The status line prints `web maps read: 0 of 0` for a dashboard that names no web map. That is
   noise, not a failure.
-- A redirect from an accepted host is followed to any `http` or `https` host when the run sends no
-  token, which is the case for a `--trust-host` host read over plain `http` and for a run with no
-  token. The answer is parsed and never printed, but it decides the verdict for that service, and
-  the request is still a blind GET that a server's response drives.
 - Very deep JSON nesting can exhaust the recursion limit. The run then exits 2 with "could not
   complete".
 - A symbolic or hard link given as `--out`, or an input reached through a different link, can
@@ -771,6 +785,27 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 - `OUT OF SCALE` is advisory and exits 0. Read the `VERDICT` line or the `--out` report. A job that
   reads only the exit code does not see it.
 - A scale limit that is not a number, such as the string `"24000"`, is read as no limit.
+- The keys that mark a map widget's custom initial view, `isUseCustomMapState` and
+  `initialMapState`, are guessed from the builder's source, not documented. A custom view stored
+  under another key is read as the web map's viewpoint.
+- A custom initial view on any one map widget makes the app scale unknown for every filtered layer
+  that sets a range, even when that widget shows another web map. Those layers are `UNJUDGED` and
+  the run exits 2. Give `--app-scale` for a verdict.
+- A `FEATURE_LAYER` data source that carries child ids is `NOT AUDITED` and exits 2. The tool
+  models only `WEB_MAP`, `FEATURE_SERVICE` and `MAP_SERVICE` children. The `FEATURE_LAYER` type
+  list was not checked against Esri.
+- A filter bound to a data source id that the app declares by its full id gets no scale verdict,
+  even when that id is a child of a web map data source. Builder configs normally declare only the
+  root.
+- For an ArcGIS Online portal, the token goes to every `arcgis.com` host that a web map names.
+  Audit only web maps you trust.
+- Give `--trust-host` a host name only, without `https://` and without a port. A full url never
+  matches, so the services on that host stay `UNJUDGED` and the run exits 2.
+- The Esri sentences quoted in the README are shortened to the fragment the tool relies on. The
+  `minScale`, `maxScale` and 0 wording was checked against the live Esri page.
+- Only the six scale runs above can be rebuilt from this README. The other example outputs, such
+  as `RENUMBERED`, `DRIFTED` and the dashboard run, come from fixtures that the four-file rule
+  keeps out of the repo and that are not listed here.
 - A run that finds 0 references is vacuous. It does not prove that the app binds no layer, because
   a widget can bind a layer through a key the tool does not list.
 - Offline, a web map layer that names an item but no url gets no scale verdict, because there is

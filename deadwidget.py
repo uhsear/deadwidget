@@ -4214,7 +4214,8 @@ def self_test():
           service_root("https://h/a/b@c/MapServer")[0] ==
           "https://h/a/b@c/MapServer" and
           hide_userinfo("x u:pw y", "https://u:pw@h/") == "x *** y" and
-          hide_userinfo("x u:pw y", "https://h/") == "x u:pw y",
+          hide_userinfo("x u:pw y", "https://h/") == "x u:pw y" and
+          hide_userinfo("x tok y", "https://tok@h/") == "x *** y",
           "a user:password in a service url is dropped from the key  "
           "<-- pinned defect")
     check(service_root(None) == (None, None) and
