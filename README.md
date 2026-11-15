@@ -626,8 +626,8 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   better place, because every process on the machine can read a command line.
 - The token travels in the `X-Esri-Authorization: Bearer` header, never in the query string, so
   access logs do not record it. A portal older than ArcGIS Enterprise 10.5.1 does not read that
-  header. Against such a portal the run reads nothing that needs the token. The self-test pins that
-  no request line holds `token=`.
+  header, so a secured read there fails as unread. The self-test pins that no request line holds
+  `token=`. That 10.5.1 requirement is not tested against a real portal.
 - The tool sends requests only to the portal's own host, to a host named with `--trust-host`,
   and, when the portal is ArcGIS Online, to other `arcgis.com` hosts where hosted services live.
   A service url comes from web map data, which any author can write. Fetched blindly, it could
