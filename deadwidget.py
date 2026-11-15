@@ -1976,8 +1976,6 @@ def http_json(url, token=None, referer=None, bust=False,
     a service must not send a run to a host it does not read.
     """
     params = {"f": "json"}
-    if token:
-        params["token"] = token
     # A message names the url without its user:password@.
     shown = strip_userinfo(url)
     if bust:
@@ -1992,6 +1990,9 @@ def http_json(url, token=None, referer=None, bust=False,
         # message quotes the whole url, token included.
         request = urllib.request.Request(
             "%s?%s" % (shown, urllib.parse.urlencode(params)))
+        if token:
+            # A header, not ?token=: access logs record the request line.
+            request.add_header("X-Esri-Authorization", "Bearer " + token)
         if referer:
             request.add_header("Referer", referer)
         if bust:
@@ -5395,7 +5396,9 @@ def self_test():
             query = dict(urllib.parse.parse_qsl(parts.query))
             seen.append((self.headers.get("Host"), parts.path, query,
                          self.headers.get("Cache-Control"),
-                         self.headers.get("Referer")))
+                         self.headers.get("Referer"),
+                         self.headers.get("X-Esri-Authorization"),
+                         self.requestline))
             code, body = routes.get(parts.path, (404, "not found"))
             raw = body if isinstance(body, str) else json.dumps(body)
             raw = raw.encode("utf-8")
@@ -5449,7 +5452,7 @@ def self_test():
               "online: and no request at all goes to a host that only web "
               "map data names  <-- pinned defect")
         portal_hits = [s for s in seen if s[0].startswith("127.0.0.1")]
-        check(all(s[2].get("token") == token for s in portal_hits),
+        check(all(s[5] == "Bearer " + token for s in portal_hits),
               "online: every request to the portal host carries the token")
         res = [s for s in seen if s[1].endswith("config.json")][0]
         check(res[3] == "no-cache" and "_ts" in res[2],
@@ -5459,6 +5462,10 @@ def self_test():
               "and no other read is")
         check(all(s[4] == live for s in seen),
               "online: every request carries the portal as Referer")
+        check(seen and not [s for s in seen
+                            if "token=" in s[6] or "token" in s[2]],
+              "online: no request line holds token=, the token travels in "
+              "X-Esri-Authorization  <-- pinned defect")
         check(token not in out and token not in err,
               "online: the token never reaches stdout or stderr  "
               "<-- pinned defect")
@@ -5471,7 +5478,7 @@ def self_test():
               "web map and services exit 0")
         check(len(seen) == 9, "online: nine requests, two copies, one web "
                               "map and six services")
-        check(len(other) == 1 and other[0][2].get("token") == token,
+        check(len(other) == 1 and other[0][5] == "Bearer " + token,
               "online: --trust-host lets the request and the token reach a "
               "named host")
         reset(resource={"widgets": {"widget_9": {"label": "Text"}},
@@ -5489,7 +5496,7 @@ def self_test():
         check(code == 2 and "Not allowed with token ***" in out,
               "online: a portal error that echoes the token is printed "
               "redacted  <-- pinned defect")
-        check(all(s[2].get("token") == token for s in seen
+        check(all(s[5] == "Bearer " + token for s in seen
                   if s[0].startswith("127.0.0.1")),
               "online: the token is read from %s, without the trailing "
               "space a Windows set line leaves  <-- pinned defect" % TOKEN_ENV)
@@ -5529,7 +5536,7 @@ def self_test():
         code, out, err = run_cli(trusting + ["--token", token])
         check(code == 1 and "layer items read: 1 of 1" in out and [
             s for s in seen if s[1] == rest + layer_item + "/data" and
-            s[2].get("token") == token],
+            s[5] == "Bearer " + token],
               "online: a layer item's /data is read from the portal with the "
               "token, and a sublayer it omits exits 1")
         routes[rest + layer_item + "/data"] = (200, "")
@@ -5576,13 +5583,13 @@ def self_test():
               "and it says so, although its first bytes are valid JSON")
         exc = raises(lambda: http_json(live + "/a b", token="Zq9+/x"),
                      "a url urllib refuses is unread, not a crash", Unread)
-        check("Zq9" not in "%s" % exc and "***" in "%s" % exc,
-              "and urllib's error, which quotes the whole url, is redacted  "
+        check("Zq9" not in "%s" % exc and "Bearer" not in "%s" % exc,
+              "and urllib's error, which quotes the whole url, holds no token  "
               "<-- pinned defect")
         exc = raises(lambda: http_json(live + "/a b", token="Zq9 x/"),
                      "and so is one whose token holds a space", Unread)
-        check("Zq9" not in "%s" % exc and "***" in "%s" % exc,
-              "and the token's + for a space is redacted too  "
+        check("Zq9" not in "%s" % exc and "Bearer" not in "%s" % exc,
+              "and neither does one whose token holds a space or a +  "
               "<-- pinned defect")
         # Port 1 on the loopback address: if a check below ever lets the
         # request through, it fails fast with another message.
@@ -5629,7 +5636,7 @@ def self_test():
         check(code == 2 and "a redirect to a host the token may not go to "
               "was refused" in out and not [
                   s for s in seen if s[0].startswith("localhost") and
-                  "token" in s[2]],
+                  s[5]],
               "online: a redirect never carries the token to a host that may "
               "not have it  <-- pinned defect")
         relayed()
@@ -5637,7 +5644,7 @@ def self_test():
                                            "localhost"])
         check(code == 0 and [s for s in seen if s[1].endswith("Water/"
                                                               "MapServer")
-                             and s[2].get("token") == token],
+                             and s[5] == "Bearer " + token],
               "online: and it follows one to a trusted host")
         relayed()
         code, out, err = run_cli(trusting)
@@ -5688,7 +5695,7 @@ def self_test():
         dash_routes()
         code, out, err = run_cli(dash_online + ["--token", token])
         check(code == 0 and "web maps read: 1 of 1, layers read: 3 of 3" in out
-              and len(seen) == 9 and all(s[2].get("token") == token
+              and len(seen) == 9 and all(s[5] == "Bearer " + token
                                          for s in seen) and token not in out,
               "online: --dashboard reads the dashboard, each layer item, its "
               "service and layer, and the web map, with the token, and exits 0")

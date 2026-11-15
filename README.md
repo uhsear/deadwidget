@@ -72,24 +72,24 @@ PASS  and a failed run prints the failures and returns 1
 PASS  importing the tool as a module runs nothing
 PASS  and writes no bytecode file next to the tool  <-- pinned defect
 --------------------------------------------------------------------
-493 assertions, 0 failed
+494 assertions, 0 failed
 ```
 
-The full run prints all 493 assertions. The `...` line above is where this block is cut.
+The full run prints all 494 assertions. The `...` line above is where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcgis` package, no `arcpy`, and no third-party
 package. Offline mode reads saved JSON files. Online mode uses `urllib` from the standard library.
 
-The same 493 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
+The same 494 assertions pass on Windows (Python 3.13.2) and on Ubuntu (Python 3.12.3), with
 `-W error`, and the two runs print identical output once the Windows carriage returns are removed.
-Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2769 statements, 764
+Branch coverage of `deadwidget.py` under `--self-test` is 100 percent (2770 statements, 764
 branches), measured on Windows with Python 3.13.2 and `coverage run --branch`, with no line
 excluded. `pyflakes` reports nothing on Windows.
 The Ubuntu host has neither `coverage` nor `pyflakes`. The file parses with
 `ast.parse(..., feature_version=(3, 9))`, and `-W error deadwidget.py --self-test` prints
-`493 assertions, 0 failed` on Windows with Python 3.9.25 as well.
+`494 assertions, 0 failed` on Windows with Python 3.9.25 as well.
 
 ```
 git clone https://github.com/uhsear/deadwidget.git
@@ -624,6 +624,10 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
 
 - The token comes from `--token` or from `DEADWIDGET_TOKEN`. The environment variable is the
   better place, because every process on the machine can read a command line.
+- The token travels in the `X-Esri-Authorization: Bearer` header, never in the query string, so
+  access logs do not record it. A portal older than ArcGIS Enterprise 10.5.1 does not read that
+  header. Against such a portal the run reads nothing that needs the token. The self-test pins that
+  no request line holds `token=`.
 - The tool sends requests only to the portal's own host, to a host named with `--trust-host`,
   and, when the portal is ArcGIS Online, to other `arcgis.com` hosts where hosted services live.
   A service url comes from web map data, which any author can write. Fetched blindly, it could
@@ -838,8 +842,6 @@ all, such as `pythonw` under Task Scheduler with no redirect, keeps the same exi
   file is expected.
 - A token inside the `--portal` url is refused. Give the token only through `DEADWIDGET_TOKEN` or
   `--token`.
-- The token is sent in the query string, as the ArcGIS REST API allows, so a proxy or server log on
-  the way can record it.
 - A usage error that quotes a failed argument prints a `--token` value as typed. Only the
   `DEADWIDGET_TOKEN` value is redacted there.
 - The self-test quoted above is an excerpt. It is cut at the `...` line, and the count matches the
